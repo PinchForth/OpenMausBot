@@ -6,7 +6,7 @@ import { EVENTS_DIR, ensureDirs } from "../config.ts";
 import { addHeldSecretScrubber } from "../redact.ts";
 import type { RuntimeEvent } from "../contracts.ts";
 import { makeFakeDriver } from "../testing/fake-driver.ts";
-import { EventBus, type PublicationItem, type PublicationDecision } from "./bus.ts";
+import { canonicalPublicationReviewFromEnvironment, EventBus, type PublicationItem, type PublicationDecision } from "./bus.ts";
 
 const QUEUE_LIMIT = 4096;
 
@@ -657,7 +657,7 @@ describe("EventBus complete-item publication boundary", () => {
       bus.publish(event("complete", unsupported)); await bus.flush(); expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
     }
     const { bus, seen } = collect(async item => ({ kind: "canonical", binding: binding(item), context: {
-      status: "ok", source_checked: true, semantic_truth: "runtime_resolver_required", task_id: "12345678-1234-4234-8234-123456789abc", admission_id: "a".repeat(64),
+      status: "ok", source_checked: true, semantic_truth: "bounded_permission_observation", task_id: "12345678-1234-4234-8234-123456789abc", admission_id: "a".repeat(64), expires_at: new Date(Date.now()+10000).toISOString(),
     } }));
     bus.publish(event("complete", unsupported)); await bus.flush(); expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
   });
@@ -723,6 +723,23 @@ describe("EventBus complete-item publication boundary", () => {
     await bus.flush();
     expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
     expect(seen).toContainEqual(expect.objectContaining({ delta: "other provider progress" }));
+  });
+
+});
+
+
+describe("Canonical publication runtime bootstrap", () => {
+  it("leaves existing publication unchanged unless the server explicitly enables consumption", () => {
+    expect(canonicalPublicationReviewFromEnvironment({})).toBeUndefined();
+    expect(() => canonicalPublicationReviewFromEnvironment({ OS_CONTEXT_PUBLICATION: "1", OS_ACCESS_URL: "http://remote.example", OS_ACCESS_TOKEN: "fixture" })).toThrow(/HTTPS/);
+    expect(() => canonicalPublicationReviewFromEnvironment({ OS_CONTEXT_PUBLICATION: "1", OS_ACCESS_URL: "http://127.0.0.1:1" })).toThrow(/credential/);
+  });
+  it("does not send unbound conversations to the OS context authority", async () => {
+    const review=canonicalPublicationReviewFromEnvironment({OS_CONTEXT_PUBLICATION:"1",OS_ACCESS_URL:"http://127.0.0.1:1",OS_ACCESS_TOKEN:"fixture",
+      OS_CONTEXT_PUBLICATION_BINDINGS:JSON.stringify([{providerInstanceId:"owned",threadId:"os-task",turnId:"owned-turn"}])});
+    const seen: RuntimeEvent[]=[];const bus=new EventBus(()=>{},undefined,review);bus.subscribe(e=>seen.push(e));
+    bus.publish(testEvent({provider:"codex",providerInstanceId:"unrelated",threadId:"unrelated",turnId:"unrelated",type:"item.completed",itemType:"assistant_text",text:"Unrelated private conversation"}));
+    await bus.flush();expect(seen).toEqual([expect.objectContaining({text:"Unrelated private conversation"})]);
   });
 
 });

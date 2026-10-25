@@ -50,6 +50,7 @@ function isTerminalEvent(event: RuntimeEvent): boolean {
  * identity, target and reference. No consumer is installed by this interface. */
 export interface AssistantPublicationReview {
   providers: ReadonlySet<string>;
+  owns?(event: RuntimeEvent): boolean;
   review(item: Readonly<PublicationItem>): Promise<PublicationDecision>;
 }
 
@@ -71,11 +72,57 @@ export type PublicationDecision = {
   context: {
     status: "ok";
     source_checked: true;
-    semantic_truth: "runtime_resolver_required";
+    semantic_truth: "bounded_permission_observation";
     task_id: string;
     admission_id: string;
+    expires_at: string;
   };
 });
+
+const canonicalPublicationDecisions = new WeakSet<PublicationDecision>();
+
+/** Server-owned bootstrap only. Credentials use the existing OS Access bearer
+ * contract; model events cannot select the authority URL or turn review on. */
+export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv = process.env): AssistantPublicationReview | undefined {
+  if (env.OS_CONTEXT_PUBLICATION !== "1") return undefined;
+  const authority = new URL(env.OS_ACCESS_URL ?? "");
+  if (authority.username || authority.password || authority.search || authority.hash ||
+      (authority.protocol !== "https:" && !(authority.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(authority.hostname)))) {
+    throw new Error("Canonical publication requires HTTPS or loopback and no URL credentials.");
+  }
+  if (!env.OS_ACCESS_TOKEN) throw new Error("Canonical publication requires the existing scoped OS Access credential.");
+  const token = env.OS_ACCESS_TOKEN;
+  const bindings: unknown = JSON.parse(env.OS_CONTEXT_PUBLICATION_BINDINGS ?? "null");
+  if (!Array.isArray(bindings) || !bindings.length || bindings.some(b => !b ||
+      Object.keys(b).sort().join(",") !== "providerInstanceId,threadId,turnId" ||
+      Object.values(b).some(v => typeof v !== "string" || !v))) throw new Error("Runtime-owned publication bindings required.");
+  return { providers: new Set(["codex"]),
+    owns: event => bindings.some(b => b.providerInstanceId === event.providerInstanceId && b.threadId === event.threadId && b.turnId === event.turnId), review: async item => {
+    const response = await fetch(new URL("/os/context", authority), {
+      method: "POST", redirect: "error", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ mode: "native_publication", item }), signal: AbortSignal.timeout(140000),
+    });
+    if (!response.ok) throw new Error("Canonical context refused publication.");
+    const payload: unknown = await response.json();
+    if (!payload || typeof payload !== "object" || !("status" in payload) || payload.status !== "ok" || !("decision" in payload)) {
+      throw new Error("Invalid canonical publication response.");
+    }
+    const decision = payload.decision as PublicationDecision;
+    const { text: _text, ...binding } = item;
+    if (!decision || !isDeepStrictEqual(decision.binding,binding) || !["ordinary","canonical"].includes(decision.kind)) {
+      throw new Error("Canonical publication binding mismatch.");
+    }
+    if (decision.kind === "canonical") {
+      const context = decision.context;
+      if (context?.status !== "ok" || context.source_checked !== true || context.semantic_truth !== "bounded_permission_observation" ||
+          !/^[0-9a-f-]{36}$/.test(context.task_id) || !/^[0-9a-f]{64}$/.test(context.admission_id) ||
+          !Number.isFinite(Date.parse(context.expires_at)) || Date.parse(context.expires_at) <= Date.now() ||
+          !("observation" in decision) || !decision.observation) throw new Error("Canonical observation required.");
+      canonicalPublicationDecisions.add(decision);
+    }
+    return decision;
+  } };
+}
 
 const PUBLICATION_LIMIT = 262144;
 const PUBLICATION_MAX_ITEMS = 256;
@@ -133,7 +180,7 @@ export class EventBus {
   }
 
   publish(event: RuntimeEvent) {
-    if (!this.publication?.providers.has(event.provider)) {
+    if (!this.publication?.providers.has(event.provider) || (this.publication.owns && !this.publication.owns(event))) {
       this.publishReviewed(event);
       return;
     }
@@ -222,9 +269,9 @@ export class EventBus {
         ]);
       } finally { clearTimeout(timer); }
       const sameBinding = decision && isDeepStrictEqual(decision.binding, binding);
-      // A shaped ContextLoop receipt is not a qualified consuming runtime. Until
-      // that owner is wired and qualified, this boundary grants no technical handback.
-      if (!sameBinding || decision.kind !== "ordinary") {
+      // Only the authenticated consuming path creates this local capability.
+      // A model event, callback boolean or copied receipt cannot forge it.
+      if (!sameBinding || (decision.kind !== "ordinary" && (!canonicalPublicationDecisions.has(decision) || Date.parse(decision.context.expires_at) <= Date.now()))) {
         this.publicationNotice(event);
         return;
       }

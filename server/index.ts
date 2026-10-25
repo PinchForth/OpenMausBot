@@ -275,7 +275,7 @@ import {
   sendFingerprint,
   SendSequencer,
 } from "./send-idempotency.ts";
-import { EventBus } from "./harness/bus.ts";
+import { EventBus, canonicalPublicationReviewFromEnvironment } from "./harness/bus.ts";
 import { engineMemory, enginesByUse, ProviderRegistry } from "./harness/registry.ts"; import { afterFirstEngineRead, holdUntilFirstEngineRead } from "./first-engine-read.ts";
 import { ManagedDesktopProviders } from "./managed-desktop.ts";
 import { mainThread, wasOldestThread } from "./main-thread.ts";
@@ -1587,7 +1587,7 @@ utilityParentPort?.on("message", (event) => {
 });
 
 const quickFallback = new QuickModelFallback({ file: join(DATA_DIR, "refused-quick-models.json"), publish: (event) => bus.publish(event), stopped: (threadId) => directRequestOwners.get(threadId)?.stopped === true });
-const bus = new EventBus(undefined, (event) => quickFallback.take(event));
+const bus = new EventBus(undefined, (event) => quickFallback.take(event), canonicalPublicationReviewFromEnvironment());
 bus.attach(registry.instances());
 let companyRuntimeReady!: () => void;
 const companyRuntimeStarted = new Promise<void>(resolve => { companyRuntimeReady = resolve; });
