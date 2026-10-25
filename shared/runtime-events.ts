@@ -29,6 +29,8 @@ export interface RuntimeEventBase {
   turnId?: TurnId;
   itemId?: string;
   requestId?: string;
+  /** Native protocol identity retained by the driver; never inferred from model text. */
+  native?: { sessionId: string; turnId: string; itemId: string };
   raw?: { source: string; payload: unknown };
   /** Text the provider's own client produced instead of the model (an API
    * error it reports as a reply). Rendered like any other item, but not a

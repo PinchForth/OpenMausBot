@@ -335,7 +335,20 @@ const finishTurn = () => {
       },
     });
   }
-  notify("item/completed", { item: { id: "m1", type: "agentMessage", text: "done from fake codex" } });
+  if (mode === "publication-recovery") {
+    const unsupported = "Status: BLOCKED_NICK. The canonical ledger is corrupt, so I cannot continue.\nRAIL-EXHAUSTED: queries=[ledger corruption; malformed] paths=[FIX_REGISTRY.md; core/runbooks] sha=abcdef1234567 outcome=no_answer";
+    for (const delta of [unsupported.slice(0, 31), unsupported.slice(31)]) {
+      notify("item/agentMessage/delta", { itemId: "denied-item", delta });
+    }
+    notify("item/completed", { item: { id: "denied-item", type: "agentMessage", text: unsupported } });
+    notify("hook/started", { hookRunId: "stop-1", eventName: "Stop" });
+    notify("hook/completed", { hookRunId: "stop-1", eventName: "Stop", status: "blocked" });
+    const recovery = "Qualification progress continues; no technical handback is asserted.";
+    notify("item/agentMessage/delta", { itemId: "recovery-item", delta: recovery });
+    notify("item/completed", { item: { id: "recovery-item", type: "agentMessage", text: recovery } });
+  } else {
+    notify("item/completed", { item: { id: "m1", type: "agentMessage", text: "done from fake codex" } });
+  }
   const carried = process.env.FAKE_CODEX_RESTORED_USAGE ? { inputTokens: 100, cachedInputTokens: 50, outputTokens: 10 } : { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
   notify("thread/tokenUsage/updated", { tokenUsage: {
     total: { inputTokens: carried.inputTokens + 7, cachedInputTokens: carried.cachedInputTokens + 4, outputTokens: carried.outputTokens + 3 },

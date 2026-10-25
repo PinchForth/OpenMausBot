@@ -852,7 +852,6 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         lastErrorSetup: false,
         retryError: "",
         authRecovery: false,
-        lastText: "",
         sawStreamDelta: false,
         streamed: false,
         // codex reports token usage as a running total for the app-server process.
@@ -1246,7 +1245,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             const delta = typeof p.delta === "string" ? p.delta : "";
             if (delta) {
               state.sawStreamDelta = true;
-              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
+              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta, itemId: p.itemId,
+                native: { sessionId: codexThreadId!, turnId: codexTurnId!, itemId: p.itemId } });
             }
             break;
           }
@@ -1287,14 +1287,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             const item = p.item ?? {};
             if (item.type === "agentMessage") {
               if (item.text?.trim()) {
-                state.lastText = item.text;
                 if (!state.sawStreamDelta) {
-                  emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: item.text });
+                  emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: item.text, itemId: item.id,
+                    native: { sessionId: codexThreadId!, turnId: codexTurnId!, itemId: item.id } });
                 }
                 state.sawStreamDelta = false;
-                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text });
+                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text, itemId: item.id,
+                  native: { sessionId: codexThreadId!, turnId: codexTurnId!, itemId: item.id } });
               }
-              openAsyncQuestion(item, asks, steerActiveTurn, (event) => emit({ ...base(threadId, turnId), ...event }));
+              openAsyncQuestion(item, asks, steerActiveTurn, (event) => emit({ ...base(threadId, turnId), ...event,
+                ...(event.type === "request.opened" ? { origin: "output" as const, itemId: item.id,
+                  native: { sessionId: codexThreadId!, turnId: codexTurnId!, itemId: item.id } } : {}) }));
             } else if (item.type === "imageGeneration" && item.status !== "failed") {
               // The app-server returns the generated raster as base64 `result` and may expose a local
               // `savedPath`; use the bytes, never the provider-owned path.

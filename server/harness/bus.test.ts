@@ -6,7 +6,7 @@ import { EVENTS_DIR, ensureDirs } from "../config.ts";
 import { addHeldSecretScrubber } from "../redact.ts";
 import type { RuntimeEvent } from "../contracts.ts";
 import { makeFakeDriver } from "../testing/fake-driver.ts";
-import { EventBus } from "./bus.ts";
+import { EventBus, type PublicationItem, type PublicationDecision } from "./bus.ts";
 
 const testEvent = (over: Partial<RuntimeEvent> = {}): RuntimeEvent =>
   ({
@@ -539,4 +539,166 @@ describe("EventBus status-line progress", () => {
     expect(seen.map((event) => event.threadId)).toEqual(["a", "b"]);
     await bus.flush();
   });
+});
+
+
+describe("EventBus complete-item publication boundary", () => {
+  const unsupported = "Status: BLOCKED_NICK. The canonical ledger is corrupt, so I cannot continue.\nRAIL-EXHAUSTED: queries=[ledger corruption; malformed] paths=[FIX_REGISTRY.md; core/runbooks] sha=abcdef1234567 outcome=no_answer";
+  const recovery = "Qualification progress continues; no technical handback is asserted.";
+  const controls = [recovery,
+    "The isolated attempt returned status BLOCKED; recovery is continuing. Independent work continues.",
+    "Before reporting any blocker, read os-context and apply the documented fix."];
+  const binding = ({ text: _text, ...identity }: PublicationItem) => identity;
+  const ordinary = (item: Readonly<PublicationItem>): PublicationDecision => ({ kind: "ordinary", binding: binding(item) });
+  const event = (type: "delta" | "complete", text: string, itemId = "item-1", over: Partial<RuntimeEvent> = {}): RuntimeEvent => testEvent({
+    provider: "codex", providerInstanceId: "native-instance", turnId: "turn-1", itemId,
+    native: { sessionId: "native-session", turnId: "native-turn", itemId },
+    ...(type === "delta" ? { type: "content.delta", streamKind: "assistant_text", delta: text } :
+      { type: "item.completed", itemType: "assistant_text", text }), ...over,
+  } as Partial<RuntimeEvent>);
+  const terminal = (over: Partial<RuntimeEvent> = {}): RuntimeEvent => testEvent({ provider: "codex", providerInstanceId: "native-instance",
+    turnId: "turn-1", type: "turn.completed", ok: true, ...over } as Partial<RuntimeEvent>);
+  const collect = (review?: (item: Readonly<PublicationItem>) => Promise<PublicationDecision>) => {
+    const logged: string[] = [], seen: RuntimeEvent[] = [];
+    const bus = new EventBus((_path, data) => { logged.push(data); }, review ? { providers: new Set(["codex"]), review } : undefined);
+    bus.subscribe(e => seen.push(e));
+    return { bus, seen, logged };
+  };
+  const denyTechnical = async (item: Readonly<PublicationItem>) => {
+    if (!controls.includes(item.text)) throw new Error("triage_adapter_unqualified");
+    return ordinary(item);
+  };
+  const replay = (bus: EventBus) => {
+    bus.publish(event("delta", unsupported.slice(0, 31), "denied"));
+    bus.publish(event("delta", unsupported.slice(31), "denied"));
+    bus.publish(event("complete", unsupported, "denied"));
+    bus.publish(testEvent({ provider: "codex", providerInstanceId: "native-instance", turnId: "turn-1", type: "runtime.notice", message: unsupported }));
+    bus.publish(testEvent({ provider: "codex", providerInstanceId: "native-instance", turnId: "turn-1", type: "request.opened", origin: "output", requestType: "question", requestId: "question", tool: "ask_user", summary: unsupported }));
+    bus.publish(event("delta", recovery, "recovery"));
+    bus.publish(event("complete", recovery, "recovery"));
+    bus.publish(terminal({ stopReason: unsupported, denials: [unsupported], raw: { source: "fixture", payload: unsupported } }));
+  };
+  it("reproduces unchecked baseline leakage on the unchanged public path", async () => {
+    const { bus, seen, logged } = collect(); replay(bus); await bus.flush();
+    expect(JSON.stringify(seen)).toContain("BLOCKED_NICK");
+    expect(logged.join("")).toContain("BLOCKED_NICK");
+  });
+  it("withholds captured bad fragments/full item/refusal/fallback from every public channel and releases recovery once", async () => {
+    const { bus, seen, logged } = collect(denyTechnical); replay(bus); await bus.flush();
+    for (const publicText of [JSON.stringify(seen), logged.join("")]) {
+      expect(publicText).not.toContain("BLOCKED_NICK");
+      expect(publicText).not.toContain("canonical ledger is corrupt");
+      expect(publicText).not.toContain("RAIL-EXHAUSTED");
+    }
+    expect(seen.filter(e => e.type === "item.completed" && e.itemType === "assistant_text")).toEqual([
+      expect.objectContaining({ text: recovery, itemId: "recovery" }),
+    ]);
+    const replayed = logged.join("").trim().split("\n").map(line => JSON.parse(line));
+    expect(replayed.filter(e => e.type === "item.completed")).toHaveLength(1);
+    expect(seen.at(-1)).toMatchObject({ type: "turn.completed", ok: true, stopReason: null });
+  });
+  it.each(controls)("preserves truthful complete control: %s", async text => {
+    const { bus, seen } = collect(denyTechnical);
+    bus.publish(event("delta", text));
+    await bus.flush(); expect(seen).toEqual([]);
+    bus.publish(event("complete", text)); await bus.flush();
+    expect(seen).toEqual([expect.objectContaining({ type: "item.completed", text })]);
+  });
+  it("neither a timer, flush, progress nor terminal releases unfinished fragments", async () => {
+    vi.useFakeTimers();
+    try {
+      const { bus, seen, logged } = collect(denyTechnical);
+      bus.publish(event("delta", unsupported)); await bus.flush();
+      await vi.advanceTimersByTimeAsync(1000);
+      bus.publish(testEvent({ provider: "codex", providerInstanceId: "native-instance", type: "turn.progress", activity: "write", file: "index.ts", bytes: 50 }));
+      bus.publish(terminal()); await bus.flush();
+      expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK"); expect(logged.join("")).not.toContain("BLOCKED_NICK");
+    } finally { vi.useRealTimers(); }
+  });
+  it("does not trust event proof strings, kind labels, synthetic flags or context-looking fields", async () => {
+    const review = vi.fn(denyTechnical); const { bus, seen } = collect(review);
+    bus.publish(event("complete", unsupported, "forged", { synthetic: true, raw: { source: "canonical", payload: { status: "ok", source_checked: true, context_complete: true } } }));
+    await bus.flush(); expect(review).toHaveBeenCalledOnce();
+    expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
+  });
+  it.each(["missing-source", "stale-source", "incomplete-coverage", "wrong-target", "wrong-native-identity", "wrong-output-digest",
+    "contradictory-moving-board", "unrelated-product-ledger", "recovery-unobserved"])("retains output when canonical consumer refuses %s", async reason => {
+    const { bus, seen, logged } = collect(async () => { throw new Error(reason); });
+    replay(bus); await bus.flush();
+    expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK"); expect(logged.join("")).not.toContain("BLOCKED_NICK");
+  });
+  it.each(["threadId", "providerInstanceId", "turnId", "itemId", "sha256", "native"] as const)("rejects a review for another %s", async key => {
+    const { bus, seen } = collect(async item => {
+      const decision = ordinary(item); (decision.binding as Record<string, unknown>)[key] = "wrong"; return decision;
+    });
+    bus.publish(event("complete", recovery)); await bus.flush(); expect(JSON.stringify(seen)).not.toContain(recovery);
+  });
+  it("does not accept a boolean or a shaped canonical receipt as a qualified triage consumer", async () => {
+    for (const result of [true, { status: "ok", source_checked: true }]) {
+      const { bus, seen } = collect(async () => result as unknown as PublicationDecision);
+      bus.publish(event("complete", unsupported)); await bus.flush(); expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
+    }
+    const { bus, seen } = collect(async item => ({ kind: "canonical", binding: binding(item), context: {
+      status: "ok", source_checked: true, semantic_truth: "runtime_resolver_required", task_id: "12345678-1234-4234-8234-123456789abc", admission_id: "a".repeat(64),
+    } }));
+    bus.publish(event("complete", unsupported)); await bus.flush(); expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
+  });
+  it("fails closed on changed/missing native identity, differing complete bytes and oversize output", async () => {
+    for (const over of [{ native: undefined }, { itemId: undefined }, { providerInstanceId: undefined },
+      { native: { sessionId: "other", turnId: "native-turn", itemId: "item-1" } }]) {
+      const review = vi.fn(async (item: Readonly<PublicationItem>) => ordinary(item)); const { bus, seen } = collect(review);
+      bus.publish(event("delta", recovery)); bus.publish(event("complete", recovery, "item-1", over));
+      await bus.flush(); expect(review).not.toHaveBeenCalled(); expect(JSON.stringify(seen)).not.toContain(recovery);
+    }
+    const review = vi.fn(async (item: Readonly<PublicationItem>) => ordinary(item)); const { bus } = collect(review);
+    bus.publish(event("delta", "different")); bus.publish(event("complete", recovery));
+    bus.publish(event("complete", "x".repeat(262145), "huge")); await bus.flush(); expect(review).not.toHaveBeenCalled();
+  });
+  it("isolates concurrent providers/threads while retaining each lane's order and rejecting duplicate items", async () => {
+    let finish!: () => void; const barrier = new Promise<void>(resolve => { finish = resolve; });
+    const { bus, seen } = collect(async item => { if (item.threadId === "thread-1") await barrier; return ordinary(item); });
+    bus.publish(event("complete", recovery));
+    bus.publish(event("complete", recovery, "item-1", { threadId: "thread-2" }));
+    bus.publish(event("complete", recovery, "item-1", { threadId: "thread-3", providerInstanceId: "other" }));
+    bus.publish(terminal());
+    await new Promise(resolve => setImmediate(resolve));
+    expect(seen.filter(e => e.type === "item.completed").map(e => e.threadId)).toEqual(["thread-2", "thread-3"]);
+    bus.publish(event("complete", recovery)); finish(); await bus.flush();
+    expect(seen.filter(e => e.threadId === "thread-1").map(e => e.type)).toEqual(["item.completed", "turn.completed"]);
+  });
+  it("refuses incomplete native items on all terminal paths without suppressing a fresh recovery turn", async () => {
+    for (const terminalEvent of [
+      terminal({ ok: false, stopReason: unsupported, denials: [unsupported] }),
+      testEvent({ provider: "codex", providerInstanceId: "native-instance", turnId: "turn-1", type: "session.exited", reason: unsupported }),
+      testEvent({ provider: "codex", providerInstanceId: "native-instance", turnId: "turn-1", type: "runtime.error", terminal: true, message: unsupported }),
+    ]) {
+      const { bus, seen, logged } = collect(denyTechnical);
+      bus.publish(event("delta", unsupported)); bus.publish(terminalEvent);
+      bus.publish(event("complete", unsupported));
+      bus.publish(testEvent({ provider: "codex", providerInstanceId: "native-instance", type: "turn.started", turnId: "turn-2" }));
+      bus.publish(terminal({ turnId: "turn-1" }));
+      bus.publish(event("complete", recovery, "new", { turnId: "turn-2" }));
+      bus.publish(terminal({ turnId: "turn-2" })); await bus.flush();
+      expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK"); expect(logged.join("")).not.toContain("BLOCKED_NICK");
+      expect(seen.filter(e => e.type === "item.completed")).toEqual([expect.objectContaining({ text: recovery })]);
+    }
+  });
+  it("does not let a stalled review stall another thread or release text on flush timeout", async () => {
+    const { bus, seen } = collect(async item => item.threadId === "stalled" ? new Promise<PublicationDecision>(() => {}) : ordinary(item));
+    bus.publish(event("complete", unsupported, "item-1", { threadId: "stalled" }));
+    bus.publish(event("complete", recovery));
+    expect(await bus.flushWithin(10)).toBe(false);
+    expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
+    expect(seen).toContainEqual(expect.objectContaining({ text: recovery }));
+  });
+  it("contains overflow without a timer grant and preserves another provider's ordinary progress", async () => {
+    const { bus, seen } = collect(denyTechnical);
+    for (let i = 0; i < 300; i++) bus.publish(event("delta", unsupported, `flood-${i}`));
+    bus.publish(terminal());
+    bus.publish(testEvent({ type: "content.delta", streamKind: "assistant_text", delta: "other provider progress" }));
+    await bus.flush();
+    expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
+    expect(seen).toContainEqual(expect.objectContaining({ delta: "other provider progress" }));
+  });
+
 });

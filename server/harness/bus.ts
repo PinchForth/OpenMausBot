@@ -1,4 +1,6 @@
 // Fan-in event bus — port of upstream's ProviderService fan-in + EventNdjsonLogger tee, minus Effect.
+import { isDeepStrictEqual } from "node:util";
+import { createHash } from "node:crypto";
 import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -42,12 +44,55 @@ function isTerminalEvent(event: RuntimeEvent): boolean {
   return event.type === "runtime.error" && event.terminal === true;
 }
 
+/** Internal runtime dependency, never an event field or an agent-configurable grant.
+ * The runtime must classify ordinary text with its qualified canonical classifier;
+ * technical handbacks must call ContextLoop.check_native_handoff with runtime-owned
+ * identity, target and reference. No consumer is installed by this interface. */
+export interface AssistantPublicationReview {
+  providers: ReadonlySet<string>;
+  review(item: Readonly<PublicationItem>): Promise<PublicationDecision>;
+}
+
+export interface PublicationItem {
+  provider: string;
+  providerInstanceId: string;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  native: { sessionId: string; turnId: string; itemId: string };
+  text: string;
+  sha256: string;
+}
+
+export type PublicationDecision = {
+  binding: Omit<PublicationItem, "text">;
+} & ({ kind: "ordinary" } | {
+  kind: "canonical";
+  context: {
+    status: "ok";
+    source_checked: true;
+    semantic_truth: "runtime_resolver_required";
+    task_id: string;
+    admission_id: string;
+  };
+});
+
+const PUBLICATION_LIMIT = 262144;
+const WITHHELD = "Assistant output retained privately pending canonical verification. Work can continue.";
+
 export class EventBus {
+  private readonly publicationTails = new Map<string, Promise<void>>();
+  private readonly publicationQueued = new Map<string, number>();
+  private readonly publicationOverflow = new Set<string>();
+  private readonly publicationTurns = new Map<string, { turnId: string | undefined; closed: boolean }>();
+  private readonly heldItems = new Map<string, { text: string; overflow: boolean; native: RuntimeEvent["native"] }>();
+  private readonly completedItems = new Set<string>();
   private listeners = new Set<RuntimeEventListener>();
   private unsubscribes = new Map<string, () => void>();
   private pendingLogWarnings = new Map<string, RuntimeEvent>();
   private pendingText = new Map<string, { event: TextDelta; timer: ReturnType<typeof setTimeout> }>();
   private readonly appendLog: EventLogAppend;
+  private readonly publication?: AssistantPublicationReview;
   private queued: QueuedLog[] = [];
   private queuedBytes = 0;
   private pumping = false;
@@ -60,8 +105,9 @@ export class EventBus {
     this.deliver(event);
   });
 
-  constructor(appendLog: EventLogAppend = defaultAppend) {
+  constructor(appendLog: EventLogAppend = defaultAppend, publication?: AssistantPublicationReview) {
     this.appendLog = appendLog;
+    this.publication = publication;
   }
 
   attach(instances: ProviderInstance[]) {
@@ -80,6 +126,128 @@ export class EventBus {
   }
 
   publish(event: RuntimeEvent) {
+    if (!this.publication?.providers.has(event.provider)) {
+      this.publishReviewed(event);
+      return;
+    }
+    // Snapshot before queuing: a producer cannot change the text or identity while review awaits.
+    const snapshot = structuredClone(event);
+    const lane = JSON.stringify([event.provider, event.providerInstanceId, event.threadId]);
+    const count = this.publicationQueued.get(lane) ?? 0;
+    if (count >= MAX_QUEUED_EVENTS && !isTerminalEvent(event) && event.type !== "turn.started") {
+      this.publicationOverflow.add(lane);
+      return;
+    }
+    this.publicationQueued.set(lane, count + 1);
+    const prior = this.publicationTails.get(lane) ?? Promise.resolve();
+    const next = prior.then(() => this.reviewPublication(snapshot)).catch(() => {
+      this.publicationNotice(snapshot);
+    });
+    this.publicationTails.set(lane, next);
+    void next.finally(() => {
+      const remaining = (this.publicationQueued.get(lane) ?? 1) - 1;
+      if (remaining) this.publicationQueued.set(lane, remaining);
+      else this.publicationQueued.delete(lane);
+      if (this.publicationTails.get(lane) === next) this.publicationTails.delete(lane);
+    });
+  }
+
+  private publicationNotice(event: RuntimeEvent) {
+    this.publishReviewed({ eventId: newId(), provider: event.provider,
+      providerInstanceId: event.providerInstanceId, threadId: event.threadId,
+      turnId: event.turnId, createdAt: new Date().toISOString(), type: "runtime.notice", message: WITHHELD });
+  }
+
+  private async reviewPublication(event: RuntimeEvent) {
+    const lane = JSON.stringify([event.provider, event.providerInstanceId, event.threadId]);
+    const current = this.publicationTurns.get(lane);
+    if (event.type === "turn.started") {
+      this.publicationTurns.set(lane, { turnId: event.turnId, closed: false });
+      this.publicationOverflow.delete(lane);
+    }
+    if (isTerminalEvent(event) && current && event.turnId !== undefined && current.turnId !== event.turnId) return;
+    const key = JSON.stringify([event.provider, event.providerInstanceId, event.threadId, event.turnId, event.itemId]);
+    const assistantDelta = event.type === "content.delta" && event.streamKind === "assistant_text";
+    const assistantItem = event.type === "item.completed" && event.itemType === "assistant_text";
+    if (assistantDelta || assistantItem) {
+      if (this.publicationOverflow.has(lane)) return;
+      if (this.heldItems.size + this.completedItems.size >= MAX_QUEUED_EVENTS) {
+        this.publicationOverflow.add(lane);
+        this.publicationNotice(event);
+        return;
+      }
+      if (current && (current.closed || current.turnId !== event.turnId)) return;
+      if (!current) this.publicationTurns.set(lane, { turnId: event.turnId, closed: false });
+    }
+    if (assistantDelta) {
+      if (this.completedItems.has(key)) return;
+      const held = this.heldItems.get(key) ?? { text: "", overflow: false, native: event.native };
+      if (Buffer.byteLength(held.text) + Buffer.byteLength(event.delta) > PUBLICATION_LIMIT) held.overflow = true;
+      if (!held.overflow) held.text += event.delta;
+      this.heldItems.set(key, held);
+      return;
+    }
+    if (assistantItem) {
+      if (this.completedItems.has(key)) return;
+      this.completedItems.add(key);
+      const held = this.heldItems.get(key);
+      this.heldItems.delete(key);
+      const native = event.native;
+      if (!event.providerInstanceId || !event.turnId || !event.itemId || !native?.sessionId ||
+          !native.turnId || native.itemId !== event.itemId || held?.overflow ||
+          Buffer.byteLength(event.text) > PUBLICATION_LIMIT || (held && (held.text !== event.text || !isDeepStrictEqual(held.native, native)))) {
+        this.publicationNotice(event);
+        return;
+      }
+      const item: PublicationItem = { provider: event.provider, providerInstanceId: event.providerInstanceId,
+        threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, native: { ...native },
+        text: event.text, sha256: createHash("sha256").update(event.text).digest("hex") };
+      const { text: _text, ...binding } = item;
+      const decision = await this.publication!.review(Object.freeze({ ...item, native: Object.freeze(item.native) }));
+      const sameBinding = decision && isDeepStrictEqual(decision.binding, binding);
+      // A shaped ContextLoop receipt is not a qualified consuming runtime. Until
+      // that owner is wired and qualified, this boundary grants no technical handback.
+      if (!sameBinding || decision.kind !== "ordinary") {
+        this.publicationNotice(event);
+        return;
+      }
+      const { raw: _raw, ...clean } = event;
+      // Only the complete reviewed item is public. Native fragments remain in the native audit.
+      this.publishReviewed(clean);
+      return;
+    }
+    if (isTerminalEvent(event)) {
+      if (!current || event.turnId === undefined || current.turnId === event.turnId) {
+        this.publicationTurns.set(lane, { turnId: current?.turnId ?? event.turnId, closed: true });
+      }
+      const prefix = JSON.stringify([event.provider, event.providerInstanceId, event.threadId]).slice(0, -1) + ",";
+      for (const heldKey of this.heldItems.keys()) if (heldKey.startsWith(prefix)) this.heldItems.delete(heldKey);
+      for (const completedKey of this.completedItems) if (completedKey.startsWith(prefix)) this.completedItems.delete(completedKey);
+      const { raw: _raw, ...clean } = event;
+      if (clean.type === "turn.completed") {
+        const { denials: _denials, ...terminal } = clean;
+        this.publishReviewed({ ...terminal, stopReason: clean.ok ? null : "publication_review_required" });
+      } else if (clean.type === "session.exited") {
+        this.publishReviewed({ ...clean, reason: "session_exited" });
+      } else if (clean.type === "runtime.error") {
+        this.publishReviewed({ ...clean, message: WITHHELD });
+      } else this.publishReviewed(clean);
+      return;
+    }
+    if (event.type === "request.opened" && event.origin === "output") {
+      this.publicationNotice(event);
+      return;
+    }
+    if (event.type === "runtime.error" || event.type === "runtime.notice") {
+      // Provider error prose is not a second assistant-output channel.
+      this.publicationNotice(event);
+      return;
+    }
+    const { raw: _raw, ...clean } = event;
+    this.publishReviewed(clean);
+  }
+
+  private publishReviewed(event: RuntimeEvent) {
     if (event.type === "turn.progress") {
       this.progress.offer(event);
       return;
@@ -101,7 +269,8 @@ export class EventBus {
     this.write(event);
   }
 
-  flush(): Promise<void> {
+  async flush(): Promise<void> {
+    while (this.publicationTails.size) await Promise.all(this.publicationTails.values());
     for (const threadId of Array.from(this.pendingText.keys())) this.flushThread(threadId);
     return this.flushDisk();
   }

@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
-import { DATA_DIR, NATIVE_DIR } from "../config.ts";
+import { EventBus } from "../harness/bus.ts";
+import { DATA_DIR, NATIVE_DIR, EVENTS_DIR, ensureDirs } from "../config.ts";
 import { ChatGptPlanAuthController } from "./chatgpt-plan-auth.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { CodexDriver, codexNativeIncomingLogMessage, codexUpdateCommand } from "./codex.ts";
@@ -1705,6 +1706,32 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`)
     );
     expect(settled).toHaveLength(1);
     expect((settled[0] as any).text).toBe("done from fake codex");
+  });
+
+  it("contains the captured unsupported Stop sequence before public history and keeps recovery plus native audit", async () => {
+    ensureDirs();
+    process.env.FAKE_CODEX_MODE = "publication-recovery";
+    await create({ environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex") } });
+    const bus = new EventBus(undefined, { providers: new Set(["codex"]), review: async item => {
+      if (item.text !== "Qualification progress continues; no technical handback is asserted.") throw new Error("triage_adapter_unqualified");
+      const { text: _text, ...binding } = item;
+      return { kind: "ordinary", binding };
+    } });
+    const publicEvents: RuntimeEvent[] = []; bus.subscribe(event => publicEvents.push(event)); bus.attach([instance]);
+    try {
+      await instance.adapter.sendTurn({ threadId: "publication-recovery", text: "Fixture" });
+      await recorder.until(event => event.type === "turn.completed"); await bus.flush();
+      const originals = recorder.events.filter(event => event.type === "item.completed" && event.itemType === "assistant_text");
+      expect(originals).toHaveLength(2);
+      expect(originals[0]).toMatchObject({ itemId: "denied-item", native: { itemId: "denied-item", sessionId: expect.any(String), turnId: expect.any(String) } });
+      expect(JSON.stringify(originals[0])).toContain("BLOCKED_NICK");
+      expect(publicEvents.filter(event => event.type === "item.completed")).toContainEqual(expect.objectContaining({ itemId: "recovery-item" }));
+      expect(publicEvents.filter(event => event.type === "item.completed" && event.itemType === "assistant_text")).toHaveLength(1);
+      const publicHistory = readFileSync(join(EVENTS_DIR, "publication-recovery.ndjson"), "utf8");
+      expect(JSON.stringify(publicEvents)).not.toContain("BLOCKED_NICK"); expect(publicHistory).not.toContain("BLOCKED_NICK");
+      expect(readFileSync(join(NATIVE_DIR, "publication-recovery.ndjson"), "utf8")).toContain("BLOCKED_NICK");
+      expect(readFileSync(join(NATIVE_DIR, "publication-recovery.ndjson"), "utf8")).toContain('"status":"blocked"');
+    } finally { bus.detachAll(); }
   });
 
   it("reports an apply_patch as it streams, for the chat's status line", async () => {
