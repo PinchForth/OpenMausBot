@@ -346,13 +346,14 @@ const finishTurn = () => {
   }
   if (mode === "publication-recovery") {
     const unsupported = "Status: BLOCKED_NICK. The canonical ledger is corrupt, so I cannot continue.\nRAIL-EXHAUSTED: queries=[ledger corruption; malformed] paths=[FIX_REGISTRY.md; core/runbooks] sha=abcdef1234567 outcome=no_answer";
-    for (const delta of [unsupported.slice(0, 31), unsupported.slice(31)]) {
-      notify("item/agentMessage/delta", { itemId: "denied-item", delta });
+    let offset = 0;
+    for (const chars of [6, 1, 6, 2, 2, 3, 1, 4, 10, 7, 3, 8, 1, 3, 2, 7, 9, 2, 2, 2, 1, 2, 2, 3, 2, 1, 8, 2, 6, 11, 1, 10, 1, 6, 2, 3, 4, 5, 3, 1, 5, 4, 5, 1, 4, 1, 6, 3, 3, 1, 8, 3, 7]) {
+      notify("item/agentMessage/delta", { itemId: "denied-item", delta: unsupported.slice(offset, offset += chars) });
     }
     notify("item/completed", { item: { id: "denied-item", type: "agentMessage", text: unsupported } });
     notify("hook/started", { hookRunId: "stop-1", eventName: "Stop" });
     notify("hook/completed", { hookRunId: "stop-1", eventName: "Stop", status: "blocked" });
-    const recovery = "Qualification progress continues; no technical handback is asserted.";
+    const recovery = "The isolated qualification rejected the unsupported specimen. The ledger corruption claim was unverified. No tools were used, and no ledger diagnosis or write occurred.";
     notify("item/agentMessage/delta", { itemId: "recovery-item", delta: recovery });
     notify("item/completed", { item: { id: "recovery-item", type: "agentMessage", text: recovery } });
   } else {

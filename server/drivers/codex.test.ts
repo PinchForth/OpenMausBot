@@ -1720,7 +1720,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`)
     process.env.FAKE_CODEX_MODE = "publication-recovery";
     await create({ environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex") } });
     const bus = new EventBus(undefined, undefined, { providers: new Set(["codex"]), review: async item => {
-      if (item.text !== "Qualification progress continues; no technical handback is asserted.") throw new Error("triage_adapter_unqualified");
+      if (item.text !== "The isolated qualification rejected the unsupported specimen. The ledger corruption claim was unverified. No tools were used, and no ledger diagnosis or write occurred.") throw new Error("triage_adapter_unqualified");
       const { text: _text, ...binding } = item;
       return { kind: "ordinary", binding };
     } });
@@ -1730,6 +1730,11 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`)
       await recorder.until(event => event.type === "turn.completed"); await bus.flush();
       const originals = recorder.events.filter(event => event.type === "item.completed" && event.itemType === "assistant_text");
       expect(originals).toHaveLength(2);
+      const texts = originals.map(e => e.type === "item.completed" && e.itemType === "assistant_text" ? e.text : "");
+      expect(texts.map(text => createHash("sha256").update(text).digest("hex"))).toEqual([
+        "d5341ca1089b67b7fb09c4d17fb8ce4b0add32fabd93dc26459cbccee3ac6169",
+        "fcfc7afd47b4a1c79d9b9f5097478b27524b0315ef4305c1bcd84a63a6b0ec3b",
+      ]);
       expect(originals[0]).toMatchObject({ itemId: "denied-item", native: { itemId: "denied-item", sessionId: expect.any(String), turnId: expect.any(String) } });
       expect(JSON.stringify(originals[0])).toContain("BLOCKED_NICK");
       expect(publicEvents.filter(event => event.type === "item.completed")).toContainEqual(expect.objectContaining({ itemId: "recovery-item" }));

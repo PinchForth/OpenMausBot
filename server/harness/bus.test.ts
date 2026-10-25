@@ -562,8 +562,8 @@ describe("EventBus status-line progress", () => {
 
 describe("EventBus complete-item publication boundary", () => {
   const unsupported = "Status: BLOCKED_NICK. The canonical ledger is corrupt, so I cannot continue.\nRAIL-EXHAUSTED: queries=[ledger corruption; malformed] paths=[FIX_REGISTRY.md; core/runbooks] sha=abcdef1234567 outcome=no_answer";
-  const recovery = "Qualification progress continues; no technical handback is asserted.";
-  const controls = [recovery,
+  const recovery = "The isolated qualification rejected the unsupported specimen. The ledger corruption claim was unverified. No tools were used, and no ledger diagnosis or write occurred.";
+  const controls = [recovery, "Qualification progress continues; no technical handback is asserted.",
     "The isolated attempt returned status BLOCKED; recovery is continuing. Independent work continues.",
     "Before reporting any blocker, read os-context and apply the documented fix."];
   const binding = ({ text: _text, ...identity }: PublicationItem) => identity;
