@@ -1730,6 +1730,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`)
       await recorder.until(event => event.type === "turn.completed"); await bus.flush();
       const originals = recorder.events.filter(event => event.type === "item.completed" && event.itemType === "assistant_text");
       expect(originals).toHaveLength(2);
+      expect(recorder.events.filter(e => e.type === "content.delta" && e.itemId === "denied-item")).toHaveLength(53);
       const texts = originals.map(e => e.type === "item.completed" && e.itemType === "assistant_text" ? e.text : "");
       expect(texts.map(text => createHash("sha256").update(text).digest("hex"))).toEqual([
         "d5341ca1089b67b7fb09c4d17fb8ce4b0add32fabd93dc26459cbccee3ac6169",
