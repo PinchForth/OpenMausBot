@@ -722,7 +722,7 @@ describe("EventBus complete-item publication boundary", () => {
     bus.publish(testEvent({ type: "content.delta", streamKind: "assistant_text", delta: "other provider progress" }));
     await bus.flush();
     expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
-    expect(seen).toContainEqual(expect.objectContaining({ delta: "other provider progress" }));
+    expect(seen).not.toContainEqual(expect.objectContaining({ delta: "other provider progress" }));
   });
 
 });
@@ -734,12 +734,12 @@ describe("Canonical publication runtime bootstrap", () => {
     expect(() => canonicalPublicationReviewFromEnvironment({ OS_CONTEXT_PUBLICATION: "1", OS_ACCESS_URL: "http://remote.example", OS_ACCESS_TOKEN: "fixture" })).toThrow(/HTTPS/);
     expect(() => canonicalPublicationReviewFromEnvironment({ OS_CONTEXT_PUBLICATION: "1", OS_ACCESS_URL: "http://127.0.0.1:1" })).toThrow(/credential/);
   });
-  it("does not send unbound conversations to the OS context authority", async () => {
-    const review=canonicalPublicationReviewFromEnvironment({OS_CONTEXT_PUBLICATION:"1",OS_ACCESS_URL:"http://127.0.0.1:1",OS_ACCESS_TOKEN:"fixture",
-      OS_CONTEXT_PUBLICATION_BINDINGS:JSON.stringify([{providerInstanceId:"owned",threadId:"os-task",turnId:"owned-turn"}])});
+  it("never bypasses review for a new provider/thread/turn and retires static configuration", async () => {
+    expect(() => canonicalPublicationReviewFromEnvironment({OS_CONTEXT_PUBLICATION:"1",OS_ACCESS_URL:"http://127.0.0.1:1",OS_ACCESS_TOKEN:"fixture",OS_CONTEXT_PUBLICATION_BINDINGS:"[]"})).toThrow(/Static/);
+    const review=canonicalPublicationReviewFromEnvironment({OS_CONTEXT_PUBLICATION:"1",OS_ACCESS_URL:"http://127.0.0.1:1",OS_ACCESS_TOKEN:"fixture"});
     const seen: RuntimeEvent[]=[];const bus=new EventBus(()=>{},undefined,review);bus.subscribe(e=>seen.push(e));
-    bus.publish(testEvent({provider:"codex",providerInstanceId:"unrelated",threadId:"unrelated",turnId:"unrelated",type:"item.completed",itemType:"assistant_text",text:"Unrelated private conversation"}));
-    await bus.flush();expect(seen).toEqual([expect.objectContaining({text:"Unrelated private conversation"})]);
+    bus.publish(testEvent({provider:"unmatched",providerInstanceId:"new",threadId:"new",turnId:"new",type:"item.completed",itemType:"assistant_text",text:"Work cannot proceed until it is restored."}));
+    await bus.flush();expect(JSON.stringify(seen)).not.toContain("cannot proceed");
   });
 
 });

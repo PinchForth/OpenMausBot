@@ -49,6 +49,7 @@ function isTerminalEvent(event: RuntimeEvent): boolean {
  * technical handbacks must call ContextLoop.check_native_handoff with runtime-owned
  * identity, target and reference. No consumer is installed by this interface. */
 export interface AssistantPublicationReview {
+  /** Compatibility metadata only. Provider/owns labels never bypass enabled review. */
   providers: ReadonlySet<string>;
   owns?(event: RuntimeEvent): boolean;
   review(item: Readonly<PublicationItem>): Promise<PublicationDecision>;
@@ -60,7 +61,7 @@ export interface PublicationItem {
   threadId: string;
   turnId: string;
   itemId: string;
-  native: { sessionId: string; turnId: string; itemId: string };
+  native: { sessionId: string; turnId: string; itemId: string } | null;
   text: string;
   sha256: string;
 }
@@ -72,7 +73,7 @@ export type PublicationDecision = {
   context: {
     status: "ok";
     source_checked: true;
-    semantic_truth: "bounded_permission_observation";
+    semantic_truth: "bounded_permission_observation" | "bounded_ledger_observation";
     task_id: string;
     admission_id: string;
     expires_at: string;
@@ -92,12 +93,8 @@ export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv
   }
   if (!env.OS_ACCESS_TOKEN) throw new Error("Canonical publication requires the existing scoped OS Access credential.");
   const token = env.OS_ACCESS_TOKEN;
-  const bindings: unknown = JSON.parse(env.OS_CONTEXT_PUBLICATION_BINDINGS ?? "null");
-  if (!Array.isArray(bindings) || !bindings.length || bindings.some(b => !b ||
-      Object.keys(b).sort().join(",") !== "providerInstanceId,threadId,turnId" ||
-      Object.values(b).some(v => typeof v !== "string" || !v))) throw new Error("Runtime-owned publication bindings required.");
-  return { providers: new Set(["codex"]),
-    owns: event => bindings.some(b => b.providerInstanceId === event.providerInstanceId && b.threadId === event.threadId && b.turnId === event.turnId), review: async item => {
+  if (env.OS_CONTEXT_PUBLICATION_BINDINGS) throw new Error("Static turn publication bindings are retired; runtime events and canonical accounts own association.");
+  return { providers: new Set(), review: async item => {
     const response = await fetch(new URL("/os/context", authority), {
       method: "POST", redirect: "error", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify({ mode: "native_publication", item }), signal: AbortSignal.timeout(140000),
@@ -114,7 +111,7 @@ export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv
     }
     if (decision.kind === "canonical") {
       const context = decision.context;
-      if (context?.status !== "ok" || context.source_checked !== true || context.semantic_truth !== "bounded_permission_observation" ||
+      if (context?.status !== "ok" || context.source_checked !== true || !["bounded_permission_observation","bounded_ledger_observation"].includes(context.semantic_truth) ||
           !/^[0-9a-f-]{36}$/.test(context.task_id) || !/^[0-9a-f]{64}$/.test(context.admission_id) ||
           !Number.isFinite(Date.parse(context.expires_at)) || Date.parse(context.expires_at) <= Date.now() ||
           !("observation" in decision) || !decision.observation) throw new Error("Canonical observation required.");
@@ -180,7 +177,7 @@ export class EventBus {
   }
 
   publish(event: RuntimeEvent) {
-    if (!this.publication?.providers.has(event.provider) || (this.publication.owns && !this.publication.owns(event))) {
+    if (!this.publication) {
       this.publishReviewed(event);
       return;
     }
@@ -243,25 +240,25 @@ export class EventBus {
     }
     if (assistantItem) {
       if (this.completedItems.has(key)) return;
-      this.completedItems.add(key);
+      if (event.itemId) this.completedItems.add(key);
       const held = this.heldItems.get(key);
       this.heldItems.delete(key);
       const native = event.native;
-      if (!event.providerInstanceId || !event.turnId || !event.itemId || !native?.sessionId ||
-          !native.turnId || native.itemId !== event.itemId || held?.overflow ||
+      if (!event.providerInstanceId || !event.turnId ||
+          (native && (!native.sessionId || !native.turnId || native.itemId !== event.itemId)) || held?.overflow ||
           Buffer.byteLength(event.text) > PUBLICATION_LIMIT || (held && (held.text !== event.text || !isDeepStrictEqual(held.native, native)))) {
         this.publicationNotice(event);
         return;
       }
       const item: PublicationItem = { provider: event.provider, providerInstanceId: event.providerInstanceId,
-        threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, native: { ...native },
+        threadId: event.threadId, turnId: event.turnId, itemId: event.itemId ?? event.eventId, native: native ? { ...native } : null,
         text: event.text, sha256: createHash("sha256").update(event.text).digest("hex") };
       const { text: _text, ...binding } = item;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let decision: PublicationDecision;
       try {
         decision = await Promise.race([
-          this.publication!.review(Object.freeze({ ...item, native: Object.freeze(item.native) })),
+          this.publication!.review(Object.freeze({ ...item, native: item.native ? Object.freeze(item.native) : null })),
           new Promise<never>((_resolve, reject) => {
             timer = setTimeout(() => reject(new Error("publication_review_unavailable")), PUBLICATION_REVIEW_MS);
             timer.unref?.();
