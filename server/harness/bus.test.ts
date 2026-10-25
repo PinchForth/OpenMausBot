@@ -701,13 +701,19 @@ describe("EventBus complete-item publication boundary", () => {
       expect(seen.filter(e => e.type === "item.completed")).toEqual([expect.objectContaining({ text: recovery })]);
     }
   });
-  it("does not let a stalled review stall another thread or release text on flush timeout", async () => {
-    const { bus, seen } = collect(async item => item.threadId === "stalled" ? new Promise<PublicationDecision>(() => {}) : ordinary(item));
-    bus.publish(event("complete", unsupported, "item-1", { threadId: "stalled" }));
-    bus.publish(event("complete", recovery));
-    expect(await bus.flushWithin(10)).toBe(false);
-    expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
-    expect(seen).toContainEqual(expect.objectContaining({ text: recovery }));
+  it("bounds unavailable review by refusal and permits queued truthful recovery without a timer grant", async () => {
+    vi.useFakeTimers();
+    try {
+      const { bus, seen } = collect(async item => item.text === unsupported ? new Promise<PublicationDecision>(() => {}) : ordinary(item));
+      bus.publish(event("complete", unsupported));
+      bus.publish(event("complete", recovery, "recovery"));
+      bus.publish(event("complete", recovery, "other", { threadId: "other-thread" }));
+      const timedFlush = bus.flushWithin(10); await vi.advanceTimersByTimeAsync(11); expect(await timedFlush).toBe(false);
+      expect(seen).toContainEqual(expect.objectContaining({ threadId: "other-thread", text: recovery }));
+      await vi.advanceTimersByTimeAsync(150000); await bus.flush();
+      expect(JSON.stringify(seen)).not.toContain("BLOCKED_NICK");
+      expect(seen.filter(e => e.type === "item.completed")).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
   });
   it("contains overflow without a timer grant and preserves another provider's ordinary progress", async () => {
     const { bus, seen } = collect(denyTechnical);

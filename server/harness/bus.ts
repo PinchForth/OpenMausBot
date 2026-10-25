@@ -79,6 +79,7 @@ export type PublicationDecision = {
 
 const PUBLICATION_LIMIT = 262144;
 const PUBLICATION_MAX_ITEMS = 256;
+const PUBLICATION_REVIEW_MS = 150000;
 const WITHHELD = "Assistant output retained privately pending canonical verification. Work can continue.";
 
 export class EventBus {
@@ -209,7 +210,17 @@ export class EventBus {
         threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, native: { ...native },
         text: event.text, sha256: createHash("sha256").update(event.text).digest("hex") };
       const { text: _text, ...binding } = item;
-      const decision = await this.publication!.review(Object.freeze({ ...item, native: Object.freeze(item.native) }));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let decision: PublicationDecision;
+      try {
+        decision = await Promise.race([
+          this.publication!.review(Object.freeze({ ...item, native: Object.freeze(item.native) })),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error("publication_review_unavailable")), PUBLICATION_REVIEW_MS);
+            timer.unref?.();
+          }),
+        ]);
+      } finally { clearTimeout(timer); }
       const sameBinding = decision && isDeepStrictEqual(decision.binding, binding);
       // A shaped ContextLoop receipt is not a qualified consuming runtime. Until
       // that owner is wired and qualified, this boundary grants no technical handback.
