@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CHECK_BOOT_HOLD_MS, CHECK_RUNS_PER_DAY } from "./routine-check-pacing.ts";
+import { CHECK_WAKE_MS } from "./routine-due.ts";
 import { RoutineManager, type RoutineCheckResult, type RoutineChecks, type RoutineInput, type RoutineRun } from "./routines.ts";
 
 const MINUTE = 60_000;
@@ -118,11 +119,11 @@ describe("routines with checks", () => {
     expect(h.asked).toHaveLength(1);
   });
 
-  it("only the next on-time job keeps the computer awake or wakes a Cloud, and it runs the checks then", async () => {
+  it("only the next on-time job keeps the computer awake; a Cloud also wakes hourly, and it runs the checks then", async () => {
     const h = harness();
     h.watch();
     expect(h.manager.wakeHold()).toEqual({ hold: false });
-    expect(h.manager.nextDueAt()).toBeNull();
+    expect(h.manager.nextDueAt()).toBe(h.now() + CHECK_WAKE_MS);
     const reminder = h.now() + CHECK_BOOT_HOLD_MS + 40 * MINUTE;
     h.answers.push({ wakeAt: reminder });
     await past(h, CHECK_BOOT_HOLD_MS + 15 * MINUTE);
@@ -131,7 +132,11 @@ describe("routines with checks", () => {
     h.advance(reminder - h.now());
     await h.tick();
     expect(h.asked).toHaveLength(2);
-    expect(h.manager.nextDueAt()).toBeNull();
+    expect(h.manager.wakeHold()).toEqual({ hold: false });
+    expect(h.manager.nextDueAt()).toBe(reminder + CHECK_WAKE_MS);
+    h.advance(CHECK_WAKE_MS);
+    await h.tick();
+    expect(h.asked).toHaveLength(3);
   });
 
   it("a read that fails is never nothing new: the routine says why and keeps no checked time", async () => {

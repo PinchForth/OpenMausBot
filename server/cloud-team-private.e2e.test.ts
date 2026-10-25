@@ -15,8 +15,8 @@ const OWNER = { email: "olive@acme.test", role: "owner" as const };
 const ADMIN = { email: "ari@acme.test", role: "admin" as const };
 const BOB = { email: "bob@acme.test", role: "member" as const };
 const ENGINE = `import { readFileSync as readToolCalls } from "node:fs";
-process.env.FAKE_CLAUDE_DUMP = process.env.HOME + "/dump.json";
-try { process.env.FAKE_CLAUDE_TOOL_CALLS = readToolCalls(process.env.HOME + "/tool-calls.json", "utf8"); } catch {}`;
+process.env.FAKE_CLAUDE_DUMP = process.env.FAKE_CLAUDE_FIXTURE_DIR + "/dump.json";
+try { process.env.FAKE_CLAUDE_TOOL_CALLS = readToolCalls(process.env.FAKE_CLAUDE_FIXTURE_DIR + "/tool-calls.json", "utf8"); } catch {}`;
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 const bobKey = personKey({ id: "", email: BOB.email });
 

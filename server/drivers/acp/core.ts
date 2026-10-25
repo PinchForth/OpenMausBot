@@ -10,7 +10,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { createHash } from "node:crypto";
 
 import { PROVIDER_CREDENTIAL_ENV, stripControlPlaneEnv, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
-import { openStartupModelCatalog, writeStartupModelCache } from "../../startup-model-catalog.ts";
+import { openStartupModelCatalog, readStartupModelCache, writeStartupModelCache } from "../../startup-model-catalog.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { DeviceAuthController, type DeviceSignIn } from "../device-auth.ts";
 import { deletePromptSplitReceipt, promptHalves, readPromptSplitReceipt, splitSessionPrompt, writePromptSplitReceipt } from "../prompt-split.ts";
@@ -20,12 +20,13 @@ import { runAcpOneShot } from "./background-text.ts";
 import { sanitizeAcpToolMessage } from "./tool-log.ts";
 import { stripLeakedSystemHarnessMessages } from "../../../shared/system-message-guard.ts";
 import {
-  classifyQuiet, describeQuiet, lastSeenPhrase, LogTail, quietKey, sampleProcessTree,
+  classifyQuiet, describeQuiet, formatQuietLimit, lastSeenPhrase, LogTail, promptIdleTimeoutMs, quietKey, sampleProcessTree,
   type LogSignal, type ProcessSample, type QuietState,
 } from "./quiet-status.ts";
 import { readSessionReport } from "./session-reports.ts";
-import { acpVariantOption, offeredModels } from "./config-options.ts";
-import { versionFromProbe } from "./version-probe.ts";
+import { offeredModels } from "./config-options.ts";
+import { SessionModelControls, type AcpModelSelection } from "./session-model-controls.ts";
+import { versionFromProbe } from "./version-probe.ts"; import { engineHomes } from "../../engine-homes/engine-homes.ts";
 
 export function skipSubscriptionAuthForLocalInject(model: string | undefined): boolean {
   return Boolean(decodeInjectId(model));
@@ -56,7 +57,7 @@ import { appendNative } from "../native.ts";
 import { acpSessionOperationKey, acpShellRequest, answersAlone, permissionLaunchCwd } from "../permission-command.ts";
 import { openQuestionRequest, questionRequestFor, type AcpQuestionRequest } from "./question-requests.ts";
 import { commandSummary, toolDetailPreview } from "../../tool-summary.ts";
-import { extractMcpImages } from "../../mcp-tool-images.ts";
+import { acpToolEndEvents } from "./tool-items.ts";
 import { AcpHost, type AcpLink } from "./host.ts";
 import { recoveryPromptFor } from "../../resume-recovery.ts";
 import { engineIdleMs, sessionIdlePolicy } from "../session-idle.ts";
@@ -64,6 +65,7 @@ import { classifyError } from "../retry.ts";
 import { engineFailureKind, engineFailureMessage } from "../engine-errors.ts";
 import { narrowsNativeTools, parseToolScope } from "../../../shared/tool-scope.ts";
 import { acpMcpServers, type AcpMcpServer } from "../turn-mcp.ts"; import { acpToolProgress } from "../tool-progress.ts";
+import { learnedToolCountLimit, mcpToolBudget, retryUnderToolLimit } from "../../tool-count-limit.ts"; import { instanceEnvNames } from "../../bot-box/env.ts";
 
 /** Failures fixed on the provider account, not by retrying; the reporting process stays pooled. */
 export type AccountErrorCode = Extract<ProviderErrorCode,
@@ -103,6 +105,7 @@ interface AcpTurn {
   /** Tool calls started and not yet finished: a tool such as `sleep` sends nothing while it runs. */
   runningTools: Set<string>;
   unkeyedToolIds: string[];
+  endedToolIds: Set<string>;
   interruptTimer: ReturnType<typeof setTimeout> | null;
   stopQuietWatch: (() => void) | null;
   flushAssistantText: () => void;
@@ -145,7 +148,7 @@ export interface AcpSupport {
   displayName: string;
   /** Omit for subscription CLIs. Custom-only CLIs have no first-party cloud catalog. */
   access?: "subscription" | "custom";
-  models: { default: string; options: Array<{ id: string; label: string }> };
+  models: ModelCatalog;
   /** Effort levels the CLI accepts, ascending; omit when it has none. Static because describe()
    * runs before any session exists. */
   effortLevels?: readonly EffortLevel[];
@@ -182,7 +185,7 @@ export interface AcpSupport {
   credentialEnv?: readonly string[];
   /** Select the model through a session config option instead of argv (opencode's ACP subcommand
    *  takes no -m). The agent must confirm it before the prompt. */
-  selectModel?: { configId: string };
+  selectModel?: AcpModelSelection;
   /** With `selectModel`: the model a turn runs when it asked for none or for one this session does
    * not offer; null keeps the strict behaviour. */
   fallbackModel?(sessionConfig: unknown, catalogDefault: string): string | null;
@@ -233,6 +236,8 @@ export interface AcpSupport {
   clientCapabilitiesMeta?: Record<string, unknown>;
   /** The agent reaches MCP servers by URL: OpenMausBot's own servers are this server's endpoints, no process each. */
   ownMcpOverHttp?: boolean;
+  /** How many tools the agent lists of its own beside the MCP servers', counted against a provider's tool limit. */
+  engineTools?: number;
   /** Do not retain stderr from providers that may place OAuth material there. */
   redactStderr?: boolean;
   /** The agent's own debug log, read while a prompt is quiet: a new line proves it alive and `parse`
@@ -306,18 +311,6 @@ const SHARED_SESSIONS_MAX = 6, SHARED_SESSIONS_LIFETIME = 12;
 const HEALTHY_CLOSE = new Set(["idle", "reset", "contract", "stop", "stopAll", "dispose", "approval-unconfirmed"]);
 /** ACP agents may compact their history silently; re-send the full prompt after this many bare turns. */
 const ACP_PROMPT_RE_ANCHOR_TURNS = 8;
-// Prompt silence guard (0 disables). Healthy agents go quiet for minutes: Qwen Code 0.24 sends
-// nothing while it compresses history, backs off a rate limit (60 s up to 5 min per wait) or runs
-// one model request (its SDK waits up to 600 s); a wedged OpenCode turn goes silent forever.
-export const DEFAULT_ACP_PROMPT_IDLE_MS = 15 * 60_000;
-const promptIdleTimeoutMs = (): number => {
-  const raw = process.env.OPENMAUS_ACP_PROMPT_IDLE_TIMEOUT_MS;
-  if (raw === undefined) return DEFAULT_ACP_PROMPT_IDLE_MS;
-  const ms = Number(raw);
-  return Number.isFinite(ms) && ms > 0 ? ms : 0;
-};
-const formatQuietLimit = (ms: number): string =>
-  ms >= 120_000 && ms % 60_000 === 0 ? `${ms / 60_000} min` : `${Math.round(ms / 1000)} s`;
 /** A `tool_call` without a status is pending (ACP's default); a `tool_call_update` without one leaves the call as it was. */
 function trackRunningTool(current: AcpTurn, update: { toolCallId?: unknown; status?: unknown }, defaultStatus?: "pending"): void {
   if (typeof update.toolCallId !== "string" || !update.toolCallId) return;
@@ -403,7 +396,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         support.transformEnv?.(env, activeConfig, instanceId, input.environment);
         return env;
       };
-      let models = support.models;
+      let models = support.resolveModels && support.resolveModelsOnCreate === false
+        ? readStartupModelCache(instanceId) ?? support.models : support.models;
       let accountModels: ReadonlySet<string> | null = null;
       const refreshModels = async () => {
         if (!support.resolveModels) return;
@@ -691,7 +685,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         hostKey: string | null): AcpHost => {
         const running = sharedHost(hostKey);
         if (running) return running;
-        const child = spawnCli(launch.command, argv, { cwd, env, stdio: ["pipe", "pipe", "pipe"] }, "bot");
+        const child = spawnCli(launch.command, argv, { cwd, env, stdio: ["pipe", "pipe", "pipe"], box: { allowEnv: instanceEnvNames(input.environment, env) } }, "bot");
         const host = new AcpHost(child, hostKey, { source: SOURCE, logMessage: nativeLogMessage, keepStderr: !support.redactStderr, unrouted: refuse });
         hosts.add(host);
         child.once("close", () => hosts.delete(host));
@@ -933,6 +927,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           if (!current || !current.state.promptSent) return;
           const u = p.update ?? {};
+          const finished = u.status === "completed" || u.status === "failed";
+          const toolEnded = (itemId: string | undefined) => {
+            current.state.producedItem = true;
+            for (const event of acpToolEndEvents(u, itemId, current.endedToolIds)) emit({ ...base(threadId, current.turnId), ...event });
+          };
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
               const content = u.content;
@@ -970,33 +969,25 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             case "tool_call": {
               current.flushAssistantText();
               trackRunningTool(current, u, "pending");
+              // ACP can send a tool_call already marked completed or failed (e.g. on a denied permission) with no
+              // tool_call_update after it.
+              const itemId = (typeof u.toolCallId === "string" && u.toolCallId) ? u.toolCallId
+                : finished ? `acp-tool-unkeyed-${++unkeyedToolSeq}` : nextUnkeyedToolId(current);
               emit({
                 ...base(threadId, current.turnId),
                 type: "item.started",
                 itemType: "tool",
-                itemId: (typeof u.toolCallId === "string" && u.toolCallId) ? u.toolCallId : nextUnkeyedToolId(current),
+                itemId,
                 title: String(u.rawInput?.command ?? u.title ?? "tool").slice(0, 80),
                 summary: commandSummary(u.rawInput),
                 input: toolDetailPreview(u.rawInput),
               });
+              if (finished) toolEnded(itemId);
               break;
             }
             case "tool_call_update": {
               trackRunningTool(current, u);
-              if (u.status === "completed" || u.status === "failed") {
-                current.state.producedItem = true;
-                emit({
-                  ...base(threadId, current.turnId),
-                  type: "item.completed",
-                  itemType: "tool",
-                  itemId: (typeof u.toolCallId === "string" && u.toolCallId) ? u.toolCallId : current.unkeyedToolIds.shift(),
-                  ok: u.status !== "failed",
-                  output: toolDetailPreview(u.rawOutput ?? u.content),
-                });
-                for (const img of extractMcpImages(u.content ?? u.rawOutput)) {
-                  emit({ ...base(threadId, current.turnId), type: "item.completed", itemType: "assistant_image", data: img.data });
-                }
-              }
+              if (finished) toolEnded((typeof u.toolCallId === "string" && u.toolCallId) ? u.toolCallId : current.unkeyedToolIds.shift());
               break;
             }
             case "usage_update":
@@ -1072,7 +1063,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         return session;
       };
 
-      const sendTurn = async (turn: SendTurnInput) => {
+      const sendTurn = async (turn: SendTurnInput, retryOf?: string) => {
         requireRunning();
         if (startupModelRefresh) await startupModelRefresh;
         requireRunning();
@@ -1091,7 +1082,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         if (controlsHost && turnConfig.fullAuto && turn.approvalMode !== "full") {
           throw new Error("local computer control requires interactive provider approvals");
         }
-        const turnId = newId();
+        const turnId = retryOf ?? newId();
         const cwd = turn.cwd ?? turnConfig.workspace ?? homedir();
         const env = childEnv(turnConfig);
         if (
@@ -1108,7 +1099,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
         }
         const resolvedModel = support.resolveTurnModel?.(turn.model, env);
-        const mcpServers = acpMcpServers(turn, { http: support.ownMcpOverHttp === true, engine: support.driverKind });
+        const toolLimitKey = JSON.stringify([instanceId, resolvedModel ?? null]);
+        const mcpServers = acpMcpServers(turn, { http: support.ownMcpOverHttp === true, engine: support.driverKind,
+          toolBudget: mcpToolBudget(learnedToolCountLimit(toolLimitKey), support.engineTools ?? 32) });
         support.applyTurnEnv?.(env, {
           model: resolvedModel, requestedModel: turn.model, fullAuto: turnConfig.fullAuto === true, botId: turn.botId, cwd, toolScope: turn.toolScope,
           threadId, mcpServers,
@@ -1152,8 +1145,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           ? { ...spawnEnv, [support.sessionModelEnv]: launchModel }
           : spawnEnv;
         let launchedThisTurn = false;
-        // The folder and the tool selection ride session/new, so threads differing only there can share a process.
-        const hostKey = support.shareProcess && inheritedScopeFingerprint === null ? JSON.stringify([...processContract, launchModel ?? null]) : null;
+        // The folder and the tool selection ride session/new, so threads differing only there can share a process; never two audiences of a Team Cloud, whose engine homes differ.
+        const hostKey = support.shareProcess && inheritedScopeFingerprint === null ? JSON.stringify([...processContract, launchModel ?? null, engineHomes.scope()]) : null;
         const launchSession = () => {
           const opened = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], launchEnv, cwd, contractKey, hostKey);
           opened.launchModel = launchModel;
@@ -1209,36 +1202,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         let staleProcess = false;
       // Still set if configuring throws: the pooled session may keep an earlier turn's looser mode.
         let approvalUnconfirmed = false;
-        const modelOf = (result: any): string | null => {
-          const option = (Array.isArray(result?.configOptions) ? result.configOptions : []).find(
-            (entry: any) => entry?.id === (support.selectModel?.configId ?? "model"),
-          );
-          return typeof option?.currentValue === "string" ? option.currentValue : null;
-        };
-        const receiveModelVariants = (result: any) => {
-          session.sessionConfigResult = result;
-          if (!support.modelVariants) return;
-          const nativeModel = modelOf(result) ?? cliTurn.model;
-          if (!nativeModel) return;
-          const option = acpVariantOption(result);
-          emit({
-            ...base(threadId, turnId),
-            type: "session.model-variants",
-            model: nativeModel === cliTurn.model ? (reportedModel ?? nativeModel) : nativeModel,
-            variants: {
-              options: option?.options ?? [],
-              ...(option?.currentValue !== undefined ? { currentValue: option.currentValue } : {}),
-            },
-          });
-        };
-        const requestedVariantOption = () => {
-          if (!support.modelVariants) throw new Error(`${support.displayName} does not support model variants`);
-          const option = acpVariantOption(session.sessionConfigResult);
-          if (!option || !option.options.some((entry) => entry.id === variant)) {
-            throw new Error(`${support.displayName} does not advertise variant ${variant} for this model`);
-          }
-          return option;
-        };
+        const modelControls = new SessionModelControls({
+          selection: support.selectModel, variants: support.modelVariants === true, displayName: support.displayName,
+          model: () => cliTurn.model, reportedModel: () => reportedModel,
+          state: () => session.sessionConfigResult, store: (result) => { session.sessionConfigResult = result; },
+          report: (model, variants) => emit({ ...base(threadId, turnId), type: "session.model-variants", model, variants }),
+        });
+        const receiveModelVariants = (result: any, replace = false) => modelControls.receive(result, replace);
+        const requestedVariantOption = () => modelControls.variant(variant);
 
         const flushAssistantText = () => {
           const raw = state.text;
@@ -1258,6 +1229,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           asks,
           runningTools: new Set(),
           unkeyedToolIds: [],
+          endedToolIds: new Set(),
           interruptTimer: null,
           stopQuietWatch: null,
           flushAssistantText,
@@ -1279,7 +1251,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
         };
         active.set(threadId, { stop: () => { state.stopped = true; closeSession(threadId, "stop"); }, interrupt, turnId, asks });
-        emit({ ...base(threadId, turnId), type: "turn.started" });
+        if (retryOf === undefined) emit({ ...base(threadId, turnId), type: "turn.started" });
         session.current = current;
 
         (async () => {
@@ -1364,7 +1336,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                         loaded = true;
                         session.sessionId = cursor;
                         session.sessionKey = sessionKey;
-                        receiveModelVariants(result);
+                        receiveModelVariants(result, true);
                       }
                     },
                   );
@@ -1403,7 +1375,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               await request("session/new", { cwd, mcpServers, ...selectionParams }, NEW_SESSION_TIMEOUT, (result) => {
                 session.sessionId = typeof result?.sessionId === "string" ? result.sessionId : null;
                 session.sessionKey = sessionKey;
-                receiveModelVariants(result);
+                receiveModelVariants(result, true);
               });
               break;
             }
@@ -1426,7 +1398,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             try {
               if (support.selectModel) {
                 const { configId } = support.selectModel;
-                selectedModel = modelOf(session.sessionConfigResult);
+                selectedModel = modelControls.modelOf(session.sessionConfigResult);
                 const wanted = cliTurn.model;
                 const offered = offeredModels(session.sessionConfigResult, configId);
                 if (support.sessionModelEnv && !session.launchModel && offered.length) accountModels = new Set(offered);
@@ -1453,20 +1425,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     variant = undefined;
                   }
                 }
-                if (cliTurn.model && cliTurn.model !== selectedModel) {
-                  await request(
-                    "session/set_config_option",
-                    { sessionId, configId, value: cliTurn.model },
-                    INIT_TIMEOUT,
-                    receiveModelVariants,
-                  );
-                  selectedModel = modelOf(session.sessionConfigResult);
-                  if (selectedModel !== cliTurn.model) {
-                    throw new Error(
-                      `${DRIVER_KIND} did not switch to ${cliTurn.model} (still ${selectedModel ?? "unknown"})`,
-                    );
-                  }
-                }
+                selectedModel = await modelControls.select(request, sessionId, INIT_TIMEOUT);
               }
 
               if (support.configureSession) {
@@ -1548,7 +1507,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             const imageBlocks = support.images === true && runtimeAcceptsImages
               ? await readAcpImageBlocks(turn.images ?? [])
               : [];
-            if (support.modelVariants && cliTurn.model && modelOf(session.sessionConfigResult) !== cliTurn.model) {
+            if (support.modelVariants && cliTurn.model && !modelControls.usesAgentDefault() && modelControls.modelOf(session.sessionConfigResult) !== cliTurn.model) {
               throw new Error(`${support.displayName} changed model before the prompt`);
             }
             if (variant !== undefined && requestedVariantOption().currentValue !== variant) {
@@ -1636,6 +1595,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               deletePromptSplitReceipt(DRIVER_KIND, pendingSplitReceipt.key);
             }
             if (!state.settled) {
+              const untouched = retryOf === undefined && !state.producedItem && !state.text && !current.runningTools.size && !asks.size && !state.stopped && !session.closing;
+              if (untouched && retryUnderToolLimit(e, { key: toolLimitKey, model: resolvedModel, engine: DRIVER_KIND, retry: () => {
+                state.settled = true; session.current = null; active.delete(threadId); current.stopQuietWatch?.();
+                return sendTurn({ ...turn, startupRecovery: undefined, sessionReset: undefined, resumeCursor: session.sessionId ?? turn.resumeCursor }, turnId);
+              }, failed: (error) => { emit({ ...base(threadId, turnId), type: "runtime.error", message: error instanceof Error ? error.message : String(error) });
+                emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "rpc_error", cost: null }); } })) return;
               const message = e instanceof Error ? e.message : String(e);
               const code = support.classifyError?.(e) ?? (engineFailureKind(message) === "credits" ? "insufficient_funds" : undefined);
               const needsAuth = code === "invalid_credentials" || code === "inactive_subscription"
@@ -1791,7 +1756,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             computerMcp: true,
             composioMcp: true,
             browserMcp: true,
-            dataMcp: true, highlevelMcp: true,
+            dataMcp: true, highlevelMcp: true, deviceMcp: true,
             images: support.images !== false,
             nativeImageInput: support.images === true,
             effortLevels: support.effortLevels,

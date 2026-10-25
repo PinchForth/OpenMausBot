@@ -649,6 +649,8 @@ describe("agents-proxy MCP surface", () => {
       "request_credential",
       "request_sign_in",
       "fill_login",
+      "decide",
+      "extract",
       "memory_update",
       "retry_thread",
       "memory_log",
@@ -671,7 +673,7 @@ describe("agents-proxy MCP surface", () => {
     expect(coordinate.description).toContain("consult true asks a question");
     expect(coordinate.description).toContain('reply "none" is a one-way notice');
     expect(coordinate.description).toContain("never call assignment_status in the same turn");
-    expect(Object.keys(coordinate.inputSchema.properties)).toEqual(["group_id", "bot_ids", "message", "reason", "rework", "thread", "in_my_folder", "reply", "consult", "done_when"]);
+    expect(Object.keys(coordinate.inputSchema.properties)).toEqual(["group_id", "bot_ids", "message", "reason", "rework", "thread", "title", "in_my_folder", "reply", "consult", "done_when"]);
     expect(coordinate.inputSchema.properties.thread.enum).toEqual(["standing", "new"]);
     expect(coordinate.inputSchema.properties.reply.enum).toEqual(["resume", "none"]);
     expect(coordinate.inputSchema.properties.consult.type).toBe("boolean");

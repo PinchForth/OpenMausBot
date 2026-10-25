@@ -2,10 +2,12 @@ import { AppWindow, Crosshair } from "lucide-react";
 import type { Message } from "@/state/store";
 import { t } from "@/lib/i18n";
 import { AppMessage } from "./app/AppMessage";
+import { HelperKeySuggestion } from "./HelperKeySuggestion";
 import { MessageBoundary } from "./MessageBoundary";
 import { WidgetMessage } from "./widget/WidgetMessage";
 
 export function richRowKind(message: Message): Message["kind"] {
+  if (message.setupSuggestion) return "widget";
   if (message.kind === "widget" && !message.widget) return "text";
   if (message.kind === "app" && !message.app) return "text";
   return message.kind;
@@ -14,9 +16,11 @@ export function richRowKind(message: Message): Message["kind"] {
 export function RichMessageRow({ botId, botName, threadId, message }: { botId: string; botName: string; threadId?: string; message: Message }) {
   return (
     <MessageBoundary fallbackText={message.text ?? ""}>
-      {message.kind === "app"
-        ? <AppMessage botId={botId} botName={botName} threadId={threadId} message={message} />
-        : <WidgetMessage botId={botId} threadId={threadId} message={message} />}
+      {message.setupSuggestion
+        ? <HelperKeySuggestion threadId={threadId} message={message} />
+        : message.kind === "app"
+          ? <AppMessage botId={botId} botName={botName} threadId={threadId} message={message} />
+          : <WidgetMessage botId={botId} threadId={threadId} message={message} />}
     </MessageBoundary>
   );
 }

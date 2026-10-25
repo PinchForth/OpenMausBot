@@ -1,3 +1,4 @@
+import { botOwner, nameFromEmail } from "../shared/bot-owner.ts";
 import { canReachPeer, peerName, renderRoster, reachablePeers, type RosterMember } from "./peer-roster.ts"; import { chiefLevel } from "./chief-level.ts";
 import type { TaskRecord } from "./store.ts";
 
@@ -28,6 +29,8 @@ export function chiefOfStaffSystemPrompt(
   const chief = bots.find((bot) => bot.id === chiefId);
   const chiefSection = sectionKey(chief?.section);
   const sectionName = peerName(chiefSection) || "General";
+  const owner = chief ? botOwner(chief) : null;
+  const person = owner ? peerName(nameFromEmail(owner)) || "your person" : null;
   // The roster honours the Chief's own allow-list, or the prompt would name teammates the tools then refuse.
   const team = reachablePeers(bots, chief ?? { id: chiefId, name: "" });
   const roster = renderRoster(team, {
@@ -43,8 +46,12 @@ export function chiefOfStaffSystemPrompt(
   const isChief = !chief?.defaultBot || chief.chiefOfStaff === true;
   return [
     isChief
-      ? `You are the person's assistant and the Chief of Staff for the ${sectionName} department: their one point of contact.`
-      : `You hold a Chief of Staff's tools for the ${sectionName} department, but you are not the Chief: the daily brief, team incidents and escalations stay with the Chief.`,
+      ? person
+        ? `You are ${person}'s assistant and Chief of Staff: their one point of contact. You coordinate only the bots that report to ${person}, in every department; other people's bots are theirs.`
+        : `You are the person's assistant and the Chief of Staff for the ${sectionName} department: their one point of contact.`
+      : chief?.defaultBot?.person
+        ? `You hold a Chief of Staff's tools for the ${sectionName} department, but you are not the Chief: the daily brief, team incidents and escalations stay with the Chief.`
+        : `You hold a Chief of Staff's tools for the ${sectionName} department, but you are not the Chief: team incidents and escalations stay with the Chief. Keeping an eye on the person's day and their daily brief are yours.`,
     chief?.managedSections?.length
       ? `The owner also allows you to coordinate and propose setup changes for these departments: ${chief.managedSections.map(s => peerName(s) || "General").join(", ")}. You remain the user's single point of contact. This does not grant other bots your access, change their tool permissions, or expose unrelated conversation history. Use list_bots for the actual reachable roster.`
       : "",
@@ -59,7 +66,7 @@ export function chiefOfStaffSystemPrompt(
     delegation,
     canDelegate ? "Housekeeping: list_threads also shows threads one teammate opened on another (marked \"opened by\"), and you may close_thread those once they are idle and their work is done. Threads the person started are theirs: never close them." : "",
     canDelegate ? "When the user asks you to assemble or configure a team, use list_team_setup for the exact authorized teams, bot IDs and model catalog, then propose_team_setup once with all named specialists and their profile/model changes. Include new teams explicitly; the plan covers their creation and your access. Existing thread models and other bots' execution permissions stay unchanged. Follow the tool result: the plan applies immediately at every access level and the person can undo it; after an applied result, continue already-requested work without another confirmation. Only if review is pending, end your turn: the user's decision automatically resumes you once with a structured result. Report failed or cancelled results honestly. Do not ask for another yes, poll, or repeat the proposal. After successful setup, use the available coordination tools for already requested work. For explicitly requested bot deletion, use propose_bot_deletion separately and follow its applied or pending result too." : "",
-    chief?.managedSections?.length ? "Reachable teammates in your allowed departments:" : `Current ${sectionName} department:`,
+    person ? `Bots that report to ${person}:` : chief?.managedSections?.length ? "Reachable teammates in your allowed departments:" : `Current ${sectionName} department:`,
     roster,
   ].filter(Boolean).join("\n");
 }

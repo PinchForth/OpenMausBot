@@ -356,6 +356,19 @@ it("opens a fresh thread on a teammate with coordinate_bots thread \"new\" and g
   expect((await f.messages(f.chief.activeTaskId)).some((message: any) => message.tool?.name === "Engineering lead replied" && message.tool.output === "NEW_THREAD_RESULT verified")).toBe(true);
 }), 45_000);
 
+it("names a fresh teammate thread with coordinate_bots title", () => fixture(async f => {
+  f.plan[f.chief.id] = { steps: [{ arguments: { bot_ids: [f.lead.id], message: "TITLED_BRIEF verify the CSV export yourself", thread: "new", title: "CSV export: verify" } }],
+    reply: "Opened a titled thread", resumeReply: "The titled thread reported back" };
+  f.plan[f.lead.id] = { reply: "TITLED_RESULT verified" };
+  await f.start();
+  expect((await f.wait()).status).toBe("settled");
+  const answered = f.evidence()[0].evidence.find((entry: any) => entry.step?.arguments?.title).response.result;
+  expect(answered.isError).toBeFalsy();
+  const child = f.nodes().find((node: any) => node.botId === f.lead.id);
+  const lead = (await f.api("/api/bots")).bots.find((bot: any) => bot.id === f.lead.id);
+  expect(lead.tasks.find((task: any) => task.threadId === child.threadId)).toMatchObject({ title: "CSV export: verify", openedBy: { botId: f.chief.id, name: "Clive" } });
+}), 45_000);
+
 it("lets the opener find and close the completed task", () => fixture(async f => {
   await f.start();
   expect((await f.wait()).status).toBe("settled");

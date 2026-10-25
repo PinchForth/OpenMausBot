@@ -17,8 +17,8 @@ const DELTA_MERGE_MS = 50;
 
 const MAX_BATCH_LINES = 64;
 
-const MAX_QUEUED_EVENTS = 256;
-const MAX_QUEUED_BYTES = 1024 * 1024;
+const MAX_QUEUED_EVENTS = 4096;
+const MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 
 export type EventLogAppend = (
   path: string,
@@ -78,6 +78,7 @@ export type PublicationDecision = {
 });
 
 const PUBLICATION_LIMIT = 262144;
+const PUBLICATION_MAX_ITEMS = 256;
 const WITHHELD = "Assistant output retained privately pending canonical verification. Work can continue.";
 
 export class EventBus {
@@ -105,8 +106,12 @@ export class EventBus {
     this.deliver(event);
   });
 
-  constructor(appendLog: EventLogAppend = defaultAppend, publication?: AssistantPublicationReview) {
+  private readonly gate?: (event: RuntimeEvent) => boolean;
+
+  /** `gate` sees adapter events first; publication review also covers direct republishes. */
+  constructor(appendLog: EventLogAppend = defaultAppend, gate?: (event: RuntimeEvent) => boolean, publication?: AssistantPublicationReview) {
     this.appendLog = appendLog;
+    this.gate = gate;
     this.publication = publication;
   }
 
@@ -119,7 +124,8 @@ export class EventBus {
           console.error(`bus: dropped cross-driver event from ${instance.instanceId}`);
           return;
         }
-        this.publish({ ...event, providerInstanceId: instance.instanceId });
+        const stamped = { ...event, providerInstanceId: instance.instanceId };
+        if (!this.gate?.(stamped)) this.publish(stamped);
       });
       this.unsubscribes.set(instance.instanceId, unsub);
     }
@@ -134,7 +140,7 @@ export class EventBus {
     const snapshot = structuredClone(event);
     const lane = JSON.stringify([event.provider, event.providerInstanceId, event.threadId]);
     const count = this.publicationQueued.get(lane) ?? 0;
-    if (count >= MAX_QUEUED_EVENTS && !isTerminalEvent(event) && event.type !== "turn.started") {
+    if (count >= PUBLICATION_MAX_ITEMS && !isTerminalEvent(event) && event.type !== "turn.started") {
       this.publicationOverflow.add(lane);
       return;
     }
@@ -171,7 +177,7 @@ export class EventBus {
     const assistantItem = event.type === "item.completed" && event.itemType === "assistant_text";
     if (assistantDelta || assistantItem) {
       if (this.publicationOverflow.has(lane)) return;
-      if (this.heldItems.size + this.completedItems.size >= MAX_QUEUED_EVENTS) {
+      if (this.heldItems.size + this.completedItems.size >= PUBLICATION_MAX_ITEMS) {
         this.publicationOverflow.add(lane);
         this.publicationNotice(event);
         return;

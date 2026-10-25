@@ -11,6 +11,8 @@ export interface ConfirmDialogProps {
   title: string;
   body: ReactNode;
   confirmLabel: string;
+  /** The way out, "Cancel" unless given. */
+  cancelLabel?: string;
   tone?: ConfirmTone;
   icon?: ReactNode;
   onCancel: () => void;
@@ -87,6 +89,7 @@ export function ConfirmDialogCard({
   title,
   body,
   confirmLabel,
+  cancelLabel = "Cancel",
   tone = "danger",
   icon,
   onCancel,
@@ -132,7 +135,7 @@ export function ConfirmDialogCard({
           disabled={pending}
           className="rounded-xl px-4 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
         >
-          Cancel
+          {cancelLabel}
         </button>
         <button
           type="button"

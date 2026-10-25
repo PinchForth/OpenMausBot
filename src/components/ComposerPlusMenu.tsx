@@ -95,8 +95,12 @@ function approvalItem(name: string, choice: ApprovalChoice): SidebarMenuItem {
  * Simple mode's round + at the start of the composer: attach a file, Finish together (rooms), the thread's approval
  * level and the call mode (bots), each running the handler its Advanced button runs.
  */
-export function ComposerPlusMenu({ onAttach, goal, approval, callBotId }: {
+export function ComposerPlusMenu({ onAttach, goal, approval, callBotId, extraItems = [], circle = false }: {
   onAttach: () => void;
+  /** Entries a phone composer moves here from its hidden buttons, such as where the bot works. */
+  extraItems?: SidebarMenuItem[];
+  /** The phone dock: a round button of its own beside the field, not a small chip inside it. */
+  circle?: boolean;
   goal?: { on: boolean; onToggle: () => void };
   approval?: { name: string; choice: ApprovalChoice };
   /** The bot whose call button the call mode starts, as that button's own mode menu did. */
@@ -123,6 +127,7 @@ export function ComposerPlusMenu({ onAttach, goal, approval, callBotId }: {
       trailing: goal.on ? check : undefined,
       onSelect: goal.onToggle,
     } satisfies SidebarMenuItem] : []),
+    ...extraItems,
     ...(approval ? [approvalItem(approval.name, approval.choice)] : []),
     ...(callBotId === undefined ? [] : CALL_MODES.map((entry, index): SidebarMenuItem => {
       const unavailable = entry.id === "turns" ? turnsHelp : null;
@@ -153,9 +158,10 @@ export function ComposerPlusMenu({ onAttach, goal, approval, callBotId }: {
             "flex size-8 items-center justify-center rounded-full text-ink transition-colors",
             // An ink tint, not a fill token: in some skins the control fill is the composer's own colour.
             open ? "bg-ink/[0.12]" : "bg-ink/[0.07] hover:bg-ink/[0.12]",
+            circle && "size-11 bg-composer ring-1 ring-composer-ring",
           )}
         >
-          <Plus size={17} aria-hidden="true" />
+          <Plus size={circle ? 22 : 17} aria-hidden="true" />
         </span>
       )}
     />

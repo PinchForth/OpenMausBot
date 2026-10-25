@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance, RuntimeEvent, SendTurnInput } from "../../contracts.ts";
 import { TurnNotStartedError } from "../../contracts.ts";
+import { engineHomes } from "../../engine-homes/engine-homes.ts";
 import * as procs from "../../procs.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
@@ -111,6 +112,21 @@ describe("ACP threads sharing one agent process", () => {
     const g = await fixture({ shareProcess: false });
     await Promise.all([g.run("thread-a"), g.run("thread-b")]);
     expect(g.spawned).toHaveLength(2);
+  });
+
+  it("on a Team Cloud never shares a process between two audiences, whose engines have homes of their own", async () => {
+    const f = await fixture();
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-acp-homes-"));
+    scratches.push(dataDir);
+    engineHomes.start({ dataDir, serverHome: dataDir, audienceOf: (threadId) => (threadId === "thread-c" ? "member:p_cleo" : "member:p_ada"), threads: () => [], log: () => {} });
+    try {
+      await Promise.all(["thread-a", "thread-b"].map((threadId) => engineHomes.within(threadId, () => f.run(threadId))));
+      expect(f.spawned).toHaveLength(1);
+      expect((await engineHomes.within("thread-c", () => f.run("thread-c"))).done).toMatchObject({ ok: true });
+      expect(f.spawned).toHaveLength(2);
+    } finally {
+      engineHomes.stop();
+    }
   });
 
   it("closes only the leaving thread's session while others use the process, and ends the process with the last one", async () => {

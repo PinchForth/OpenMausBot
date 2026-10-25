@@ -2,9 +2,10 @@
 // overloaded or failing service, or any other HTTP refusal names the provider and keeps its own short reason. Each
 // sentence keeps the words classifyError (retry.ts) reads, so retries, account switching and health codes are unchanged.
 import { redactSecretsInText } from "../redact.ts";
+import { toolCountLimitFromError } from "../tool-count-limit.ts";
 import { USAGE_LIMIT } from "./retry.ts";
 
-export type EngineFailureKind = "credits" | "usage_limit" | "rate_limit" | "overloaded" | "server" | "tool_schema" | "refused";
+export type EngineFailureKind = "credits" | "usage_limit" | "rate_limit" | "overloaded" | "server" | "tool_schema" | "tool_count" | "refused";
 
 /** A provider refusing for want of credit or payment, in its own words (402 is read from the status). */
 const OUT_OF_CREDITS = /\bpayment required\b|\binsufficient (?:account )?(?:funds|balance|credits?)\b|\b(?:credit|account) balance is too low\b|\bout of credits?\b|\bno credits? (?:left|remaining)\b|\bused all (?:available |of (?:your|its) )?credits\b/i;
@@ -73,6 +74,7 @@ export function engineFailureKind(text: string, status = httpStatusOf(text)): En
   if (status === 529 || /\boverloaded\b/i.test(text)) return "overloaded";
   if (status === 429) return "rate_limit";
   if (TOOL_SCHEMA.test(text)) return "tool_schema";
+  if (toolCountLimitFromError(text) !== undefined) return "tool_count";
   if (status !== null) return status >= 500 ? "server" : "refused";
   return null;
 }
@@ -102,14 +104,16 @@ export function engineFailureMessage(
       return `${provider} refused this turn as an invalid request because the input schema of ${tool ? `the "${tool}" tool` : "one of this bot's tools"} `
         + `${problem}, so nothing ran. Turn off the MCP server or app that tool comes from for this bot, or switch the bot to another AI.`;
     }
+    case "tool_count": return `${provider} refused this turn because this model takes at most ${toolCountLimitFromError(text) ?? "a limited number of"} tools `
+      + "and this bot offers more, even with its tool lists trimmed, so nothing ran. Turn off some of this bot's apps or MCP servers, or switch the bot to another model.";
     case "refused": return `${provider} stopped with an error${detail(code, says)}.`;
   }
 }
 
-/** Only an out-of-credits failure or a refused tool schema in plain words; any other text stays as it is. */
+/** Only an out-of-credits failure or a refused tool schema or tool count in plain words; any other text stays as it is. */
 export function plainFailureMessage(provider: string, text: string): string {
   const kind = engineFailureKind(text);
-  return kind === "credits" || kind === "tool_schema" ? engineFailureMessage(provider, text, { kind })! : text;
+  return kind === "credits" || kind === "tool_schema" || kind === "tool_count" ? engineFailureMessage(provider, text, { kind })! : text;
 }
 
 /** A failed turn's stop reason as its cause: a bare provider token ("stop_sequence", "rpc_error") is never the whole
