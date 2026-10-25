@@ -2060,6 +2060,9 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`)
 
   it("starts at most the host's launch slots at once and runs the rest as slots free", async () => {
     await create();
+    await instance.adapter.sendTurn({ threadId: "t-slot-preflight", text: "Fixture preflight" });
+    await recorder.until(event => event.type === "turn.completed");
+    recorder.events.length = 0;
     const log = join(scratch, "startups.ndjson");
     vi.stubEnv("OMB_CODEX_LAUNCH_SLOTS", "2");
     vi.stubEnv("FAKE_CODEX_STARTUP_DELAY_MS", "150");
