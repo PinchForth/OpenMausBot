@@ -138,7 +138,12 @@ export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv
         const key = lane(item);
         const items = pending.get(key) ?? [];
         items.push(structuredClone(item)); pending.set(key, items);
-        payload = await request("native_publication", item);
+        // The current authority reviews immediately after real admission in
+        // the account response. Preserve the split request for older servers.
+        // A refusal carries no decision and remains ineligible below, while
+        // the actual admitted withholding still receives its destination ACK.
+        payload = "decision" in prepared || typeof prepared.publication_refused === "string"
+          ? prepared : await request("native_publication", item);
       } else payload = prepared;
     } else payload = await request("native_publication", item);
     if (payload.status !== "ok" || !("decision" in payload)) throw new Error("Invalid canonical publication response.");

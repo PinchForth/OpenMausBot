@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { EVENTS_DIR, ensureDirs } from "../config.ts";
@@ -729,6 +730,38 @@ describe("EventBus complete-item publication boundary", () => {
 
 
 describe("Canonical publication runtime bootstrap", () => {
+  it.each(["valid", "refused", "expired"])("uses the admitted account response without a second decision request (%s transport fixture)", async outcome => {
+    // This exercises authenticated transport/containment only. Actual native
+    // account and canonical source qualification live in the opt-in crossrepo test.
+    const { instance, emit } = await liveInstance();
+    instance.adapter.consumePublicationContext = async () => ({ turnId: "control", itemId: "control", native: { sessionId: "session", turnId: "control", itemId: "control" }, text: "{}" });
+    const text = "Measured source-bound technical disposition.";
+    const native = { sessionId: "session", turnId: "native-turn", itemId: "item" };
+    const binding = { provider: "fake", providerInstanceId: "inst-1", threadId: "thread-1", turnId: "turn-1", itemId: "item", native, sha256: createHash("sha256").update(text).digest("hex") };
+    const modes: string[] = [];
+    vi.stubGlobal("fetch", async (_url: unknown, options: RequestInit) => {
+      const request = JSON.parse(String(options.body)); modes.push(request.mode);
+      if (request.mode === "native_publication_prepare") return Response.json({ status: "needs_context", reason: "native_account_required", prompt: "actual source delivery belongs to the native qualifier" });
+      if (request.mode === "native_publication_account") return Response.json({ status: "ok", prepared: true,
+        ...(outcome === "refused" ? { publication_refused: "triage_narrative_unproved" } : { decision: { kind: "canonical", binding, observation: { transportFixture: true }, context: {
+          status: "ok", source_checked: true, semantic_truth: "bounded_ledger_observation", task_id: "00000000-0000-4000-8000-000000000001", admission_id: "a".repeat(64), expires_at: new Date(Date.now() + (outcome === "expired" ? -1000 : 60000)).toISOString(),
+        } } }) });
+      if (request.mode === "native_publication_ack") return Response.json({ status: "ok", phase: "acknowledged" });
+      throw new Error("A second review request reintroduces the measured expiry race.");
+    });
+    try {
+      const review = canonicalPublicationReviewFromEnvironment({ OS_CONTEXT_PUBLICATION: "1", OS_ACCESS_URL: "http://127.0.0.1:1", OS_ACCESS_TOKEN: "fixture" });
+      const logged: string[] = [], seen: RuntimeEvent[] = [];
+      const bus = new EventBus((_thread, line) => logged.push(line), undefined, review); bus.attach([instance]); bus.subscribe(e => seen.push(e));
+      emit(testEvent({ provider: "fake", turnId: "turn-1", type: "item.completed", itemType: "assistant_text", itemId: "item", native, text }));
+      emit(testEvent({ provider: "fake", turnId: "turn-1", type: "turn.completed", ok: true }));
+      await bus.flush();
+      expect(modes).toEqual(["native_publication_prepare", "native_publication_account", "native_publication_ack"]);
+      expect(seen.filter(e => e.type === "item.completed")).toHaveLength(outcome === "valid" ? 1 : 0);
+      if (outcome !== "valid") { expect(JSON.stringify(seen)).not.toContain(text); expect(logged.join("")).not.toContain(text); }
+      expect(logged.map(line => JSON.parse(line))).toEqual(seen);
+    } finally { vi.unstubAllGlobals(); }
+  });
   it("leaves existing publication unchanged unless the server explicitly enables consumption", () => {
     expect(canonicalPublicationReviewFromEnvironment({})).toBeUndefined();
     expect(() => canonicalPublicationReviewFromEnvironment({ OS_CONTEXT_PUBLICATION: "1", OS_ACCESS_URL: "http://remote.example", OS_ACCESS_TOKEN: "fixture" })).toThrow(/HTTPS/);
