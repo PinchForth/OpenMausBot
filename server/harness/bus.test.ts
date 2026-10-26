@@ -752,7 +752,7 @@ describe("Canonical publication runtime bootstrap", () => {
     try {
       const review = canonicalPublicationReviewFromEnvironment({ OS_CONTEXT_PUBLICATION: "1", OS_ACCESS_URL: "http://127.0.0.1:1", OS_ACCESS_TOKEN: "fixture" });
       const logged: string[] = [], seen: RuntimeEvent[] = [];
-      const bus = new EventBus((_thread, line) => logged.push(line), undefined, review); bus.attach([instance]); bus.subscribe(e => seen.push(e));
+      const bus = new EventBus((_thread, line) => { logged.push(line); }, undefined, review); bus.attach([instance]); bus.subscribe(e => seen.push(e));
       emit(testEvent({ provider: "fake", turnId: "turn-1", type: "item.completed", itemType: "assistant_text", itemId: "item", native, text }));
       emit(testEvent({ provider: "fake", turnId: "turn-1", type: "turn.completed", ok: true }));
       await bus.flush();
