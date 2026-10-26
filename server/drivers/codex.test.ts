@@ -157,7 +157,8 @@ describe("CodexDriver turns (fake app-server)", () => {
 
   it("keeps an actual dispatch-bound account consultation private and refuses forged references", async () => {
     ensureDirs();
-    await create({ mode: "resume", environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex"), FAKE_CODEX_MCP_OVERRIDES: "1" } });
+    const dump = join(scratch, "publication-child-env.json"); process.env.FAKE_CODEX_DUMP = dump;
+    await create({ mode: "resume", environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex"), FAKE_CODEX_MCP_OVERRIDES: "1", OS_ACCESS_TOKEN: "synthetic-publication-authority-secret" } });
     const threadId = "private-account-" + Date.now();
     await instance.adapter.sendTurn({ threadId, text: "Fixture source item", cwd: scratch, model: "fixture-model", effort: "high" });
     await recorder.until(event => event.type === "turn.completed");
@@ -176,7 +177,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(audit.some(row => row.source === "codex.runtime" && row.msg.accountFor?.sha256 === ref.sha256 && row.msg.promptSha256 === createHash("sha256").update("Fixture source account").digest("hex"))).toBe(true);
     await instance.adapter.sendTurn({ threadId, text: "Ordinary next turn", resumeCursor: item.native.sessionId });
     await recorder.until(event => event.type === "turn.completed" && event.turnId !== item.turnId);
+    const spawned = JSON.parse(readFileSync(dump, "utf8"));
+    expect(spawned.env.OS_ACCESS_TOKEN).toBeUndefined();
+    expect(JSON.stringify(spawned.argv)).not.toContain("synthetic-publication-authority-secret");
   });
+
 
   it("says once when its team tools did not start", async () => {
     await create({ environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex"), FAKE_CODEX_MCP_FAILED: "agents" } });

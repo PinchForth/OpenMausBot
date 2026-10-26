@@ -3,6 +3,7 @@
 
 /** Workspace credential env names; spawned engine CLIs must never inherit them. */
 export const WORKSPACE_CREDENTIAL_ENV = [
+  "OS_ACCESS_TOKEN", // Publication authority belongs to the parent, never the native model.
   "XAI_API_KEY",
   "MISTRAL_API_KEY",
   "CEREBRAS_API_KEY",
