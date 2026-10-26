@@ -1,6 +1,6 @@
 // Fan-in event bus — port of upstream's ProviderService fan-in + EventNdjsonLogger tee, minus Effect.
 import { isDeepStrictEqual } from "node:util";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -83,6 +83,10 @@ export type PublicationDecision = {
 });
 
 const canonicalPublicationDecisions = new WeakSet<PublicationDecision>();
+const scopedPublicationReviews = new WeakMap<AssistantPublicationReview, (event: RuntimeEvent) => Promise<boolean>>();
+const publicationBotId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const adapterEventOrigins = new WeakMap<RuntimeEvent, ProviderInstance>();
+const originalDispatches = new WeakMap<ProviderInstance["adapter"], ProviderInstance["adapter"]["sendTurn"]>();
 
 /** Server-owned bootstrap only. Credentials use the existing OS Access bearer
  * contract; model events cannot select the authority URL or turn review on. */
@@ -95,12 +99,14 @@ export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv
   }
   if (!env.OS_ACCESS_TOKEN) throw new Error("Canonical publication requires the existing scoped OS Access credential.");
   const token = env.OS_ACCESS_TOKEN;
+  const scoped = env.OS_CONTEXT_PUBLICATION_SCOPE === "registered";
+  if (env.OS_CONTEXT_PUBLICATION_SCOPE && !scoped) throw new Error("Unknown publication scope.");
   if (env.OS_CONTEXT_PUBLICATION_BINDINGS) throw new Error("Static turn publication bindings are retired; runtime events and canonical accounts own association.");
   const instances = new Map<string, ProviderInstance>();
   const pending = new Map<string, PublicationItem[]>();
   const lane = (item: { provider: string; providerInstanceId?: string; threadId: string; turnId?: string }) =>
     JSON.stringify([item.provider, item.providerInstanceId, item.threadId, item.turnId]);
-  const request = async (mode: string, item: Readonly<PublicationItem>, extra: Record<string, unknown> = {}) => {
+  const request = async (mode: string, item: Readonly<PublicationItem> | undefined, extra: Record<string, unknown> = {}) => {
     const response = await fetch(new URL("/os/context", authority), {
       method: "POST", redirect: "error", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify({ mode, item, ...extra }), signal: AbortSignal.timeout(140000),
@@ -109,8 +115,59 @@ export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv
     if (!response.ok || !payload || typeof payload !== "object") throw new Error("Canonical context refused publication.");
     return payload;
   };
-  return { providers: new Set(), attach: attached => {
-    for (const instance of attached) instances.set(instance.instanceId, instance);
+  type Dispatch = { selected: boolean; closed: boolean; ready: Promise<string | undefined> };
+  const dispatches = new Map<string, Dispatch>();
+  const starting = new Map<string, Dispatch>();
+  const turnKey = (instance: string, thread: string, turn?: string) => JSON.stringify([instance, thread, turn]);
+  const selection = async () => {
+    const requestId = randomUUID();
+    const payload = await request("native_publication_scope", undefined, { request_id: requestId });
+    const accounts = payload.accounts as Array<{ bot_id: string; principal: string; providers: string[]; topic: string }>;
+    const source = payload.source as { head?: string; blob?: string } | undefined;
+    if (payload.status !== "ok" || payload.request_id !== requestId || payload.scope !== "registered" || !/^[0-9a-f]{40}$/.test(source?.head ?? "") ||
+        !/^[0-9a-f]{40}$/.test(source?.blob ?? "") || !Array.isArray(accounts) || !accounts.length || accounts.some(a =>
+          !a || !publicationBotId.test(a.bot_id) || typeof a.principal !== "string" || !a.principal || typeof a.topic !== "string" || !a.topic ||
+          !Array.isArray(a.providers) || !a.providers.length || a.providers.some(p => typeof p !== "string" || !p)) ||
+        new Set(accounts.map(a => a.bot_id)).size !== accounts.length) throw new Error("Invalid canonical publication scope selection.");
+    return accounts;
+  };
+  const protection = async (event: RuntimeEvent): Promise<boolean> => {
+    const instance = event.providerInstanceId ? instances.get(event.providerInstanceId) : undefined;
+    if (!instance || adapterEventOrigins.get(event) !== instance || instance.driverKind !== event.provider || !event.turnId) return true;
+    const entry = dispatches.get(turnKey(instance.instanceId, event.threadId, event.turnId)) ??
+      starting.get(turnKey(instance.instanceId, event.threadId));
+    if (!entry || entry.closed || await entry.ready !== event.turnId) return true;
+    if (!entry.selected && isTerminalEvent(event)) entry.closed = true;
+    return entry.selected;
+  };
+  const review: AssistantPublicationReview = { providers: new Set(), attach: attached => {
+    for (const instance of attached) {
+      instances.set(instance.instanceId, instance);
+      if (!scoped) continue;
+      const adapter = instance.adapter;
+      const original = originalDispatches.get(adapter) ?? adapter.sendTurn;
+      originalDispatches.set(adapter, original);
+      adapter.sendTurn = async input => {
+        const { botId, threadId } = input;
+        // This is the existing server dispatcher call, not a model event label.
+        // Selection is reread for every real dispatch; it is not a turn whitelist.
+        const accounts = await selection();
+        let finish!: (turn: string | undefined) => void;
+        const entry: Dispatch = { closed: false, selected: !publicationBotId.test(botId ?? "") || accounts.some(a => a.bot_id === botId),
+          ready: new Promise(resolve => { finish = resolve; }) };
+        const key = turnKey(instance.instanceId, threadId);
+        starting.set(key, entry);
+        try {
+          const result = await original.call(adapter, { ...input, botId, threadId });
+          if (!result.turnId) throw new Error("Actual publication dispatch returned no turn.");
+          dispatches.set(turnKey(instance.instanceId, threadId, result.turnId), entry);
+          while (dispatches.size > 1024) dispatches.delete(dispatches.keys().next().value!);
+          finish(result.turnId);
+          return result;
+        } catch (error) { finish(undefined); throw error; }
+        finally { if (starting.get(key) === entry) starting.delete(key); }
+      };
+    }
   }, afterTurn: async event => {
     const key = lane(event);
     for (const item of pending.get(key) ?? []) {
@@ -162,6 +219,8 @@ export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv
     }
     return decision;
   } };
+  if (scoped) scopedPublicationReviews.set(review, protection);
+  return review;
 }
 
 const PUBLICATION_LIMIT = 262144;
@@ -214,6 +273,7 @@ export class EventBus {
           return;
         }
         const stamped = { ...event, providerInstanceId: instance.instanceId };
+        adapterEventOrigins.set(stamped, instance);
         if (!this.gate?.(stamped)) this.publish(stamped);
       });
       this.unsubscribes.set(instance.instanceId, unsub);
@@ -227,6 +287,8 @@ export class EventBus {
     }
     // Snapshot before queuing: a producer cannot change the text or identity while review awaits.
     const snapshot = structuredClone(event);
+    const origin = adapterEventOrigins.get(event);
+    if (origin) adapterEventOrigins.set(snapshot, origin);
     const lane = JSON.stringify([event.provider, event.providerInstanceId, event.threadId]);
     const count = this.publicationQueued.get(lane) ?? 0;
     if (count >= PUBLICATION_MAX_ITEMS && !isTerminalEvent(event) && event.type !== "turn.started") {
@@ -254,6 +316,13 @@ export class EventBus {
   }
 
   private async reviewPublication(event: RuntimeEvent) {
+    // Only the authenticated factory and real dispatched adapter origin can
+    // select unprotected baseline delivery. Direct/model/callback labels cannot.
+    const protection = this.publication ? scopedPublicationReviews.get(this.publication) : undefined;
+    if (protection && await protection(event) === false) {
+      this.publishReviewed(event);
+      return;
+    }
     const lane = JSON.stringify([event.provider, event.providerInstanceId, event.threadId]);
     const current = this.publicationTurns.get(lane);
     if (event.type === "turn.started") {
@@ -328,17 +397,25 @@ export class EventBus {
       const prefix = JSON.stringify([event.provider, event.providerInstanceId, event.threadId]).slice(0, -1) + ",";
       for (const heldKey of this.heldItems.keys()) if (heldKey.startsWith(prefix)) this.heldItems.delete(heldKey);
       for (const completedKey of this.completedItems) if (completedKey.startsWith(prefix)) this.completedItems.delete(completedKey);
-      const { raw: _raw, ...clean } = event;
-      if (clean.type === "turn.completed") {
-        const { denials: _denials, ...terminal } = clean;
-        this.publishReviewed({ ...terminal, stopReason: clean.ok ? null : "publication_review_required" });
-      } else if (clean.type === "session.exited") {
-        this.publishReviewed({ ...clean, reason: "session_exited" });
-      } else if (clean.type === "runtime.error") {
-        this.publishReviewed({ ...clean, message: WITHHELD });
-      } else this.publishReviewed(clean);
+      // Provider extensions such as lastText must not become a final fallback.
+      const base = { eventId: event.eventId, provider: event.provider, providerInstanceId: event.providerInstanceId,
+        threadId: event.threadId, turnId: event.turnId, createdAt: event.createdAt };
+      if (event.type === "turn.completed") {
+        const usage = event.usage && Number.isFinite(event.usage.input) && Number.isFinite(event.usage.output)
+          ? { input: event.usage.input, output: event.usage.output,
+              ...(Number.isFinite(event.usage.cachedInput) ? { cachedInput: event.usage.cachedInput } : {}) } : undefined;
+        this.publishReviewed({ ...base, type: "turn.completed", ok: event.ok,
+          stopReason: event.ok ? null : "publication_review_required", usage,
+          ...(typeof event.cost === "number" && Number.isFinite(event.cost) ? { cost: event.cost } : {}) });
+      } else if (event.type === "session.exited") {
+        this.publishReviewed({ ...base, type: "session.exited", reason: "session_exited" });
+      } else if (event.type === "runtime.error") {
+        this.publishReviewed({ ...base, type: "runtime.error", terminal: true, message: WITHHELD });
+      } else if (event.type === "cap.exhausted") {
+        this.publishReviewed({ ...base, type: "cap.exhausted", handoffPath: event.handoffPath, reason: "cap" });
+      }
       await this.flushDisk();
-      await this.publication?.afterTurn?.(clean);
+      await this.publication?.afterTurn?.(event);
       return;
     }
     if (event.type === "request.opened" && event.origin === "output") {

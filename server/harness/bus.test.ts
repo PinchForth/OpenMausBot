@@ -776,3 +776,107 @@ describe("Canonical publication runtime bootstrap", () => {
   });
 
 });
+
+describe("Trusted registered-account staging", () => {
+  const selectedBot = "00000000-0000-4000-8000-000000000001";
+  const otherFixtureBot = "00000000-0000-4000-8000-000000000002";
+  const env = { OS_CONTEXT_PUBLICATION: "1", OS_CONTEXT_PUBLICATION_SCOPE: "registered",
+    OS_ACCESS_URL: "http://127.0.0.1:1", OS_ACCESS_TOKEN: "fixture" };
+  const scope = () => ({ status: "ok", scope: "registered", source: { head: "a".repeat(40), blob: "b".repeat(40) },
+    accounts: [{ bot_id: selectedBot, principal: "fixture", providers: ["codex"], topic: "fixture-ledger" }] });
+  it("preserves unselected dispatch baseline while selected, forged and unmatched output stays contained", async () => {
+    const { instance, emit } = await liveInstance();
+    const modes: string[] = [];
+    vi.stubGlobal("fetch", async (_url: unknown, opts: RequestInit) => {
+      const request = JSON.parse(String(opts.body)); modes.push(request.mode);
+      if (request.mode === "native_publication_scope") return Response.json({...scope(),request_id:request.request_id});
+      return Response.json({ status: "needs_context", reason: "identity_unqualified" }, { status: 409 });
+    });
+    try {
+      const seen: RuntimeEvent[] = [], logged: string[] = [];
+      const bus = new EventBus((_t, line) => { logged.push(line); }, undefined, canonicalPublicationReviewFromEnvironment(env));
+      bus.attach([instance]); bus.subscribe(e => seen.push(e));
+      await Promise.all([
+        instance.adapter.sendTurn({ threadId: "selected", botId: selectedBot, text: "fixture dispatch" }),
+        instance.adapter.sendTurn({ threadId: "baseline", botId: otherFixtureBot, text: "fixture dispatch" }),
+      ]);
+      const bad = "The ledger is malformed. Work cannot proceed until it is restored.";
+      for (const threadId of ["selected", "baseline", "unmatched"]) {
+        const e = { provider: "fake", threadId, turnId: "fake-turn", itemId: "item-"+threadId };
+        emit(testEvent({ ...e, type: "content.delta", streamKind: "assistant_text", delta: bad }));
+        emit(testEvent({ ...e, type: "item.completed", itemType: "assistant_text", text: bad,
+          ...({ botId: otherFixtureBot } as object) }));
+        emit(testEvent({ ...e, type: "turn.completed", ok: true, ...({ lastText: bad } as object) }));
+      }
+      // Matching IDs or a caller callback cannot mint a dispatcher origin.
+      bus.publish(testEvent({ provider: "fake", providerInstanceId: instance.instanceId, threadId: "baseline",
+        turnId: "fake-turn", itemId: "direct", type: "item.completed", itemType: "assistant_text", text: "direct forgery" }));
+      emit(testEvent({ provider: "fake", threadId: "baseline", turnId: "not-the-dispatched-turn", itemId: "wrong",
+        type: "item.completed", itemType: "assistant_text", text: "wrong turn forgery" }));
+      await bus.flush();
+      expect(seen.filter(e => e.type === "item.completed").map(e => e.threadId)).toEqual(["baseline"]);
+      expect(seen.some(e => e.type === "content.delta" && e.threadId === "baseline")).toBe(true);
+      expect(JSON.stringify(seen.filter(e => e.threadId !== "baseline"))).not.toContain(bad);
+      expect(JSON.stringify(seen)).not.toContain("direct forgery");
+      expect(JSON.stringify(seen)).not.toContain("wrong turn forgery");
+      const replay = logged.flatMap(chunk => chunk.trim().split("\n").filter(Boolean).map(line => JSON.parse(line))) as RuntimeEvent[];
+      for (const thread of new Set(seen.map(e => e.threadId)))
+        expect(replay.filter(e => e.threadId === thread)).toEqual(JSON.parse(JSON.stringify(seen.filter(e => e.threadId === thread))));
+      expect(seen.find(e => e.threadId === "baseline" && e.type === "turn.completed")).toHaveProperty("lastText", bad);
+      expect(modes.filter(m => m === "native_publication_scope")).toHaveLength(2);
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it("rereads selection on next dispatch and after reattach without reviving a closed baseline turn", async () => {
+    const { instance, emit } = await liveInstance(); let seq=0, additionallySelected=false;
+    instance.adapter.sendTurn=async () => ({turnId:"real-return-"+(++seq)});
+    vi.stubGlobal("fetch", async (_url: unknown, opts: RequestInit) => {
+      const request=JSON.parse(String(opts.body));
+      if(request.mode === "native_publication_scope")return Response.json({ ...scope(), request_id:request.request_id, accounts: [...scope().accounts,
+        ...(additionallySelected ? [{...scope().accounts[0],bot_id:otherFixtureBot,topic:"second-fixture"}] : [])] });
+      return Response.json({status:"needs_context",reason:"identity_unqualified"},{status:409});
+    });
+    try {
+      let bus=new EventBus(()=>{},undefined,canonicalPublicationReviewFromEnvironment(env));const seen:RuntimeEvent[]=[];
+      bus.attach([instance]);bus.subscribe(e=>seen.push(e));
+      const first=await instance.adapter.sendTurn({threadId:"resume",botId:otherFixtureBot,text:"fixture"});
+      const body=(turnId:string,itemId:string,text:string)=>testEvent({threadId:"resume",provider:"fake",turnId,itemId,type:"item.completed",itemType:"assistant_text",text});
+      emit(body(first.turnId,"first","unprotected baseline"));emit(testEvent({threadId:"resume",turnId:first.turnId,type:"turn.completed",ok:true}));await bus.flush();
+      additionallySelected=true;
+      const next=await instance.adapter.sendTurn({threadId:"resume",botId:otherFixtureBot,text:"fixture resumed dispatch"});
+      emit(body(first.turnId,"late","closed scope escape"));emit(body(next.turnId,"next","next-turn escape"));
+      await bus.flush();bus.detach(instance.instanceId);
+      bus=new EventBus(()=>{},undefined,canonicalPublicationReviewFromEnvironment(env));bus.attach([instance]);bus.subscribe(e=>seen.push(e));
+      const resumed=await instance.adapter.sendTurn({threadId:"fresh-thread",botId:otherFixtureBot,text:"fixture after restart"});
+      emit(testEvent({provider:"fake",threadId:"fresh-thread",turnId:resumed.turnId,itemId:"new",type:"item.completed",itemType:"assistant_text",text:"restart escape"}));
+      await bus.flush();expect(seen.flatMap(e=>e.type==="item.completed" && e.itemType==="assistant_text" ? [e.text] : [])).toEqual(["unprotected baseline"]);
+      expect(JSON.stringify(seen)).not.toContain("scope escape");expect(JSON.stringify(seen)).not.toContain("restart escape");
+    } finally {vi.unstubAllGlobals();}
+  });
+  it("cannot opt out with an arbitrary scope callback", async () => {
+    const seen: RuntimeEvent[] = [];
+    const review = { providers: new Set<string>(), protection: async () => false,
+      review: async () => { throw new Error("no canonical consumer"); } };
+    const bus = new EventBus(() => {}, undefined, review); bus.subscribe(e => seen.push(e));
+    bus.publish(testEvent({ type: "item.completed", itemType: "assistant_text", text: "untrusted callback escape" }));
+    await bus.flush(); expect(JSON.stringify(seen)).not.toContain("untrusted callback escape");
+  });
+  it("rejects a replayed scope response even when its account/source shape is valid", async () => {
+    const {instance}=await liveInstance();
+    vi.stubGlobal("fetch",async()=>Response.json({...scope(),request_id:"an-old-scope-request"}));
+    try {
+      const bus=new EventBus(()=>{},undefined,canonicalPublicationReviewFromEnvironment(env));bus.attach([instance]);
+      await expect(instance.adapter.sendTurn({threadId:"replayed",botId:otherFixtureBot,text:"fixture"})).rejects.toThrow(/scope/i);
+    }finally{vi.unstubAllGlobals();}
+  });
+  it("refuses malformed selection rather than silently starting an unprotected dispatch", async () => {
+    const { instance } = await liveInstance();
+    vi.stubGlobal("fetch", async (_url:unknown, opts:RequestInit) => {
+      const request=JSON.parse(String(opts.body));
+      return Response.json({ ...scope(), request_id:request.request_id, accounts: [...scope().accounts, ...scope().accounts] });
+    });
+    try {
+      const bus = new EventBus(() => {}, undefined, canonicalPublicationReviewFromEnvironment(env));bus.attach([instance]);
+      await expect(instance.adapter.sendTurn({ threadId: "bad", botId: otherFixtureBot, text: "fixture" })).rejects.toThrow(/scope|selection/i);
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
