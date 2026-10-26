@@ -258,6 +258,15 @@ export interface ProviderAdapter {
     engineAdmission?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
+  /** Internal source-account consultation on the actual original dispatch/session.
+   * No external tool exposes this operation; absent drivers remain unqualified. */
+  consumePublicationContext?(reference: {
+    threadId: string; turnId: string; itemId: string; sha256: string;
+    native: { sessionId: string; turnId: string; itemId: string };
+  }, prompt: string): Promise<{
+    turnId: string; itemId: string; native: { sessionId: string; turnId: string; itemId: string }; text: string;
+  }>;
+
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
   /** Never throws for a vanished ask: `unavailable` means nobody could take the answer, and the caller treats it as a deny. */
   respondToRequest(

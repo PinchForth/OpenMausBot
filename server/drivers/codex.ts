@@ -619,7 +619,23 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     }
     const active = new Map<string, Turn>();
 
+    type PublicationReference = Parameters<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>[0];
+    type PublicationAccount = Awaited<ReturnType<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>>;
+    const publicationDispatches = new Map<string, { turnId: string; input: SendTurnInput; sessionId?: string; items: Map<string, { native: NonNullable<RuntimeEvent["native"]>; sha256: string }> }>();
+    const privateAccounts = new Map<string, { reference: PublicationReference; prompt: string; accept: RuntimeEventListener }>();
     const emit = (event: RuntimeEvent) => {
+      const control = privateAccounts.get(event.threadId);
+      if (control) {
+        if (event.type === "runtime.error") appendNative(event.threadId, { dir: "in", source: "codex.runtime", msg: { kind: "account_error", message: event.message } });
+        control.accept(event); return;
+      }
+      const dispatch = publicationDispatches.get(event.threadId);
+      if (dispatch && dispatch.turnId === event.turnId) {
+        if (event.type === "session.started" && event.sessionId) dispatch.sessionId = event.sessionId;
+        if (event.type === "item.completed" && event.itemType === "assistant_text" && event.itemId && event.native) {
+          dispatch.items.set(event.itemId, { native: event.native, sha256: createHash("sha256").update(event.text).digest("hex") });
+        }
+      }
       for (const l of Array.from(listeners)) l(event);
     };
     const base = (threadId: string, turnId: string) => ({
@@ -687,6 +703,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       assertPlanCurrent();
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
+      if (!privateAccounts.has(threadId)) {
+        publicationDispatches.set(threadId, { turnId, input: { ...turn }, items: new Map() });
+        if (publicationDispatches.size > 256) publicationDispatches.delete(publicationDispatches.keys().next().value!);
+      }
       if (signedOut) {
         emit({ ...base(threadId, turnId), type: "turn.started" });
         emit({ ...base(threadId, turnId), type: "runtime.error", message: codexNotSignedIn(), setup: true });
@@ -891,6 +911,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 }
                 // Bind synchronously: one stdout chunk can hold the response, events, completion and a late request.
                 codexTurnId = v.turn.id;
+                const account = privateAccounts.get(threadId);
+                appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
+                  kind: "publication_binding", providerInstanceId: instanceId, threadId, turnId,
+                  native: { sessionId: codexThreadId, turnId: codexTurnId },
+                  accountFor: account?.reference ?? null,
+                  promptSha256: account ? createHash("sha256").update(account.prompt).digest("hex") : null,
+                } });
                 startingNativeTurn = false;
                 for (const notification of earlyNotifications.splice(0)) {
                   if (state.settled || abandoned) break;
@@ -1686,6 +1713,53 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     return { turnId };
   };
 
+  const consumePublicationContext: NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]> = async (reference, prompt) => {
+    if (!prompt || Buffer.byteLength(prompt) > 131072 || privateAccounts.has(reference.threadId)) throw new Error("Native context consultation unavailable.");
+    const original = publicationDispatches.get(reference.threadId);
+    const nativeItem = original?.items.get(reference.itemId);
+    if (!original || original.turnId !== reference.turnId || !nativeItem || nativeItem.sha256 !== reference.sha256 ||
+        JSON.stringify(nativeItem.native) !== JSON.stringify(reference.native) || original.sessionId !== reference.native.sessionId) {
+      throw new Error("Native publication does not match this actual dispatch.");
+    }
+    if (active.has(reference.threadId)) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { listeners.delete(listener); reject(new Error("Original native turn has not completed.")); }, 30000);
+        const listener: RuntimeEventListener = event => {
+          if (event.threadId === reference.threadId && event.turnId === reference.turnId && event.type === "turn.completed") {
+            clearTimeout(timer); listeners.delete(listener); queueMicrotask(resolve);
+          }
+        };
+        listeners.add(listener);
+      });
+    }
+    if (active.has(reference.threadId) || publicationDispatches.get(reference.threadId) !== original) throw new Error("Native dispatch changed during consultation.");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await new Promise<PublicationAccount>((resolve, reject) => {
+        const items: PublicationAccount[] = [];
+        privateAccounts.set(reference.threadId, { reference: structuredClone(reference), prompt, accept: event => {
+          if (event.type === "item.completed" && event.itemType === "assistant_text" && event.itemId && event.native) {
+            items.push({ turnId: event.turnId!, itemId: event.itemId, native: event.native, text: event.text });
+          }
+          if (event.type === "request.opened") reject(new Error("A confined source account cannot request external effects."));
+          if (event.type === "turn.completed") {
+            if (event.ok && items.length === 1 && items[0].native.sessionId === reference.native.sessionId) resolve(items[0]);
+            else reject(new Error(`Native source account did not complete exactly once in the original session (${event.stopReason}; items=${items.length}).`));
+          }
+        } });
+        timer = setTimeout(() => { void active.get(reference.threadId)?.stop(); reject(new Error("Native source account timed out.")); }, 120000);
+        void sendTurn({ ...original.input, text: prompt, resumeCursor: reference.native.sessionId,
+          sessionReset: false, recoveryText: undefined, transcript: undefined, images: undefined,
+          approvalMode: "ask", integrations: {}, toolScope: { allow: ["native:*"] }, guestConfined: true,
+        }).catch(reject);
+      });
+    } finally {
+      clearTimeout(timer);
+      if (privateAccounts.has(reference.threadId)) await active.get(reference.threadId)?.stop();
+      privateAccounts.delete(reference.threadId);
+    }
+  };
+
   const versionOf = cliVersionReader(config.cli);
   const snapshot = async (): Promise<ProviderSnapshot> => {
     if (planUnavailable) return { state: "unavailable", authenticated: false, chatgptPlan: true, reason: planUnavailable, authenticationUnavailableReason: planUnavailable };
@@ -1818,6 +1892,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         strictResume: true,
       },
       sendTurn,
+      consumePublicationContext,
       interruptTurn: async (threadId) => {
         await active.get(threadId)?.stop();
       },

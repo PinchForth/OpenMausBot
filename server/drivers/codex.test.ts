@@ -155,6 +155,29 @@ describe("CodexDriver turns (fake app-server)", () => {
     scratch = mkdtempSync(join(tmpdir(), "omb-codex-test-"));
   });
 
+  it("keeps an actual dispatch-bound account consultation private and refuses forged references", async () => {
+    ensureDirs();
+    await create({ mode: "resume", environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex"), FAKE_CODEX_MCP_OVERRIDES: "1" } });
+    const threadId = "private-account-" + Date.now();
+    await instance.adapter.sendTurn({ threadId, text: "Fixture source item", cwd: scratch, model: "fixture-model", effort: "high" });
+    await recorder.until(event => event.type === "turn.completed");
+    const item = recorder.events.find(event => event.type === "item.completed" && event.itemType === "assistant_text")!;
+    if (item.type !== "item.completed" || item.itemType !== "assistant_text" || !item.native || !item.itemId || !item.turnId) throw new Error("Fixture native item absent");
+    const ref = { threadId, turnId: item.turnId, itemId: item.itemId, native: item.native, sha256: createHash("sha256").update(item.text).digest("hex") };
+    await expect(instance.adapter.consumePublicationContext!({ ...ref, sha256: "0".repeat(64) }, "not sent")).rejects.toThrow(/actual dispatch/);
+    const before = recorder.events.length;
+    const account = await instance.adapter.consumePublicationContext!(ref, "Fixture source account").catch(error => {
+      const audit = readFileSync(join(NATIVE_DIR, threadId + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      throw new Error(String(error) + "; fake RPC errors: " + JSON.stringify(audit.filter(row => row.msg?.error || row.msg?.kind === "account_error").map(row => row.msg.error ?? row.msg)));
+    });
+    expect(account.native.sessionId).toBe(item.native.sessionId);
+    expect(recorder.events.length).toBe(before);
+    const audit = readFileSync(join(NATIVE_DIR, threadId + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(audit.some(row => row.source === "codex.runtime" && row.msg.accountFor?.sha256 === ref.sha256 && row.msg.promptSha256 === createHash("sha256").update("Fixture source account").digest("hex"))).toBe(true);
+    await instance.adapter.sendTurn({ threadId, text: "Ordinary next turn", resumeCursor: item.native.sessionId });
+    await recorder.until(event => event.type === "turn.completed" && event.turnId !== item.turnId);
+  });
+
   it("says once when its team tools did not start", async () => {
     await create({ environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex"), FAKE_CODEX_MCP_FAILED: "agents" } });
     await instance.adapter.sendTurn({ threadId: "team-tools", text: "Fixture" });

@@ -53,6 +53,8 @@ export interface AssistantPublicationReview {
   providers: ReadonlySet<string>;
   owns?(event: RuntimeEvent): boolean;
   review(item: Readonly<PublicationItem>): Promise<PublicationDecision>;
+  attach?(instances: ProviderInstance[]): void;
+  afterTurn?(event: RuntimeEvent): Promise<void>;
 }
 
 export interface PublicationItem {
@@ -94,16 +96,52 @@ export function canonicalPublicationReviewFromEnvironment(env: NodeJS.ProcessEnv
   if (!env.OS_ACCESS_TOKEN) throw new Error("Canonical publication requires the existing scoped OS Access credential.");
   const token = env.OS_ACCESS_TOKEN;
   if (env.OS_CONTEXT_PUBLICATION_BINDINGS) throw new Error("Static turn publication bindings are retired; runtime events and canonical accounts own association.");
-  return { providers: new Set(), review: async item => {
+  const instances = new Map<string, ProviderInstance>();
+  const pending = new Map<string, PublicationItem[]>();
+  const lane = (item: { provider: string; providerInstanceId?: string; threadId: string; turnId?: string }) =>
+    JSON.stringify([item.provider, item.providerInstanceId, item.threadId, item.turnId]);
+  const request = async (mode: string, item: Readonly<PublicationItem>, extra: Record<string, unknown> = {}) => {
     const response = await fetch(new URL("/os/context", authority), {
       method: "POST", redirect: "error", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify({ mode: "native_publication", item }), signal: AbortSignal.timeout(140000),
+      body: JSON.stringify({ mode, item, ...extra }), signal: AbortSignal.timeout(140000),
     });
-    if (!response.ok) throw new Error("Canonical context refused publication.");
-    const payload: unknown = await response.json();
-    if (!payload || typeof payload !== "object" || !("status" in payload) || payload.status !== "ok" || !("decision" in payload)) {
-      throw new Error("Invalid canonical publication response.");
+    const payload = await response.json() as Record<string, unknown>;
+    if (!response.ok || !payload || typeof payload !== "object") throw new Error("Canonical context refused publication.");
+    return payload;
+  };
+  return { providers: new Set(), attach: attached => {
+    for (const instance of attached) instances.set(instance.instanceId, instance);
+  }, afterTurn: async event => {
+    const key = lane(event);
+    for (const item of pending.get(key) ?? []) {
+      const ack = await request("native_publication_ack", item);
+      if (ack.status !== "ok" || ack.phase !== "acknowledged") throw new Error("Canonical destination acknowledgement refused.");
     }
+    pending.delete(key);
+  }, review: async item => {
+    const instance = instances.get(item.providerInstanceId);
+    const consume = instance?.driverKind === item.provider ? instance.adapter.consumePublicationContext : undefined;
+    let payload: Record<string, unknown>;
+    if (consume && item.native) {
+      let prepared = await request("native_publication_prepare", item);
+      for (let pass = 0; prepared.status === "needs_context" && pass < 2; pass++) {
+        if (prepared.reason !== "native_account_required" || typeof prepared.prompt !== "string") throw new Error("Canonical native account unavailable.");
+        // The supported driver verifies the actual original dispatch and keeps
+        // this confined same-session account turn private in its native audit.
+        const reference = { threadId: item.threadId, turnId: item.turnId, itemId: item.itemId,
+          native: { ...item.native }, sha256: item.sha256 };
+        const native_account = await consume.call(instance!.adapter, reference, prepared.prompt);
+        prepared = await request("native_publication_account", item, { native_account });
+      }
+      if (prepared.status !== "ok") throw new Error("Canonical native account incomplete.");
+      if (prepared.prepared === true) {
+        const key = lane(item);
+        const items = pending.get(key) ?? [];
+        items.push(structuredClone(item)); pending.set(key, items);
+        payload = await request("native_publication", item);
+      } else payload = prepared;
+    } else payload = await request("native_publication", item);
+    if (payload.status !== "ok" || !("decision" in payload)) throw new Error("Invalid canonical publication response.");
     const decision = payload.decision as PublicationDecision;
     const { text: _text, ...binding } = item;
     if (!decision || !isDeepStrictEqual(decision.binding,binding) || !["ordinary","canonical"].includes(decision.kind)) {
@@ -161,6 +199,7 @@ export class EventBus {
   }
 
   attach(instances: ProviderInstance[]) {
+    this.publication?.attach?.(instances);
     for (const instance of instances) {
       this.detach(instance.instanceId);
       const unsub = instance.adapter.onEvent((event) => {
@@ -293,6 +332,8 @@ export class EventBus {
       } else if (clean.type === "runtime.error") {
         this.publishReviewed({ ...clean, message: WITHHELD });
       } else this.publishReviewed(clean);
+      await this.flushDisk();
+      await this.publication?.afterTurn?.(clean);
       return;
     }
     if (event.type === "request.opened" && event.origin === "output") {
