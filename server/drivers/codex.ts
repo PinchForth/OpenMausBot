@@ -914,6 +914,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 const account = privateAccounts.get(threadId);
                 appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
                   kind: "publication_binding", providerInstanceId: instanceId, threadId, turnId,
+                  botId: turn.botId ?? null, cwd: turn.cwd ?? null,
                   native: { sessionId: codexThreadId, turnId: codexTurnId },
                   accountFor: account?.reference ?? null,
                   promptSha256: account ? createHash("sha256").update(account.prompt).digest("hex") : null,
