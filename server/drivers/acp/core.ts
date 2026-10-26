@@ -198,6 +198,8 @@ export interface AcpSupport {
   /** The approval mode is applied per turn by configureSession, which must throw unless the runtime
    * confirms it; an approval change never respawns the process. */
   sessionScopedApproval?: boolean;
+  /** This runtime keys every update by its actual native session. Do not use single-link fallback for its text. */
+  strictSessionUpdates?: boolean;
   /** False when this engine cannot run memory upkeep's one-shot text call cleanly. */
   backgroundText?: false;
   /** Mutate the child env in place. `instanceEnvironment` tells a key put there on purpose from one
@@ -916,6 +918,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // Vendor side-channels (grok's `_x.ai/*`) are only teed to the native log.
           if (msg.method !== "session/update") return;
           const p = msg.params ?? {};
+          if (support.strictSessionUpdates && (!session.sessionId || p.sessionId !== session.sessionId)) return;
           if (p._meta?.isReplay === true) return;
           const current = session.current;
           if (support.modelVariants && p.update?.sessionUpdate === "config_option_update") {
@@ -1065,6 +1068,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
       const sendTurn = async (turn: SendTurnInput, retryOf?: string) => {
         requireRunning();
+        // No ACP support implements the no-command/no-outside-read contract. Plan mode permits native reads.
+        // Refuse before startup probes, admission, spawning or reusing a live session; do not silently run unconfined.
+        if (turn.guestConfined) throw new Error(`${support.displayName}: confined guest turns are not supported by this engine.`);
         if (startupModelRefresh) await startupModelRefresh;
         requireRunning();
         const parsedScope = parseToolScope(turn.toolScope);
@@ -1186,8 +1192,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           receive?: (result: any) => void,
           idleMs?: number,
           idleMessage?: string | (() => string),
+          dispatched?: (requestId: number) => void,
         ): Promise<any> =>
-          session.acp.request(method, params, timeoutMs, receive, idleMs, idleMessage);
+          session.acp.request(method, params, timeoutMs, receive, idleMs, idleMessage, dispatched);
 
         const state: AcpTurn["state"] = { settled: false, promptSent: false, text: "", textMessageId: null, producedItem: false, startupActivity: false, stopped: false, usagePeak: null, usageLast: null, usageCompacted: false };
         let acknowledge = () => {};
@@ -1518,9 +1525,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             acknowledge();
             const promptIdleMs = promptIdleTimeoutMs();
             const quiet = startQuietWatch(threadId, session, current);
+            const promptParams = { sessionId, prompt: [{ type: "text", text }, ...imageBlocks] };
+            let promptRequestId: number | null = null;
             const result = await request(
               "session/prompt",
-              { sessionId, prompt: [{ type: "text", text }, ...imageBlocks] },
+              promptParams,
               undefined,
               undefined,
               promptIdleMs,
@@ -1530,7 +1539,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   `${last ? ` (last seen: ${lastSeenPhrase(last)})` : ""}. ` +
                   "Send the message again to retry. On a self-hosted server, OPENMAUS_ACP_PROMPT_IDLE_TIMEOUT_MS sets this limit (0 turns it off).";
               },
+              requestId => {
+                promptRequestId = requestId;
+                appendNative(threadId, { dir: "out", source: "acp.runtime", msg: {
+                  kind: "prompt_dispatch", provider: DRIVER_KIND, providerInstanceId: instanceId,
+                  botId: turn.botId ?? null, threadId, turnId, cwd,
+                  protocol: { name: "acp", sessionId, requestId, processId: session.child.pid ?? null },
+                  requestSha256: createHash("sha256").update(JSON.stringify(promptParams)).digest("hex"),
+                } });
+              },
               );
+            appendNative(threadId, { dir: "in", source: "acp.runtime", msg: {
+              kind: "prompt_result", provider: DRIVER_KIND, providerInstanceId: instanceId,
+              botId: turn.botId ?? null, threadId, turnId,
+              protocol: { name: "acp", sessionId, requestId: promptRequestId, processId: session.child.pid ?? null },
+              stopReason: typeof result?.stopReason === "string" ? result.stopReason : null,
+            } });
             if (pendingSplitReceipt) {
               // session/prompt resolving is the acceptance boundary: a rejected prompt leaves no receipt.
               if (state.usageCompacted) {

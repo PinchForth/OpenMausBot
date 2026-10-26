@@ -28,6 +28,89 @@ import * as quietStatus from "./quiet-status.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
 
+describe("Kimi publication dispatch boundary", () => {
+  const instances: ProviderInstance[] = [];
+  const folders: string[] = [];
+  afterEach(async () => {
+    for (const instance of instances.splice(0)) await instance.dispose();
+    for (const folder of folders.splice(0)) await removeTempDir(folder);
+  });
+  const fixture = async (extra: Record<string, string> = {}) => {
+    ensureDirs(); chmodSync(FAKE_CLI, 0o755);
+    const home = mkdtempSync(join(tmpdir(), "omb-kimi-publication-")); folders.push(home);
+    const launches = join(home, "launches");
+    const instance = await KimiAgentDriver.create({ instanceId: "kimi-publication-fixture", displayName: undefined, enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false }, environment: { HOME: home, USERPROFILE: home,
+        FAKE_ACP_TEXT_REPLY: "Truthful progress", FAKE_ACP_LAUNCH_COUNT_FILE: launches, ...extra } });
+    instances.push(instance);
+    return { instance, home, launches, recorder: recordEvents(instance.adapter) };
+  };
+
+  it("refuses confined dispatch before process admission, then preserves ordinary progress", async () => {
+    const { instance, launches, recorder } = await fixture();
+    const admission = vi.fn();
+    await expect(instance.adapter.sendTurn({ threadId: randomUUID(), text: "Must not execute", guestConfined: true,
+      engineAdmission: admission })).rejects.toThrow(/confined.*not supported/i);
+    expect(admission).not.toHaveBeenCalled();
+    expect(existsSync(launches)).toBe(false);
+    const threadId = randomUUID();
+    await instance.adapter.sendTurn({ threadId, text: "Progress" });
+    await recorder.until(e => e.type === "turn.completed" && e.threadId === threadId);
+    expect(recorder.events.filter(e => e.type === "item.completed" && e.itemType === "assistant_text")
+      .map(e => e.type === "item.completed" && e.itemType === "assistant_text" ? e.text : "")).toEqual(["Truthful progress"]);
+    const launched = readFileSync(launches, "utf8");
+    await expect(instance.adapter.sendTurn({ threadId, text: "Must not join", guestConfined: true,
+      engineAdmission: admission })).rejects.toThrow(/confined.*not supported/i);
+    expect(admission).not.toHaveBeenCalled();
+    expect(readFileSync(launches, "utf8")).toBe(launched);
+    const next = await instance.adapter.sendTurn({ threadId, text: "Continue" });
+    await recorder.until(e => e.type === "turn.completed" && e.turnId === next.turnId);
+    expect(recorder.events.filter(e => e.type === "item.completed" && e.itemType === "assistant_text")).toHaveLength(2);
+    expect(instance.adapter.capabilities.guestTurns).toBeUndefined();
+  });
+
+  it("correlates next-turn and resumed prompt ids from the real host audit without invented native item ids", async () => {
+    const { instance, recorder } = await fixture();
+    const threadId = randomUUID();
+    const first = await instance.adapter.sendTurn({ threadId, botId: "fixture-bot", text: "first" });
+    await recorder.until(e => e.type === "turn.completed" && e.turnId === first.turnId);
+    const session = recorder.events.find(e => e.type === "session.started");
+    expect(session?.type).toBe("session.started");
+    const second = await instance.adapter.sendTurn({ threadId, botId: "fixture-bot", text: "second",
+      resumeCursor: session?.type === "session.started" ? session.sessionId : undefined });
+    await recorder.until(e => e.type === "turn.completed" && e.turnId === second.turnId);
+    // Native logging is buffered independently of event delivery.
+    let log: any[] = [];
+    await vi.waitFor(() => {
+      log = readFileSync(join(NATIVE_DIR, `${threadId}.ndjson`), "utf8").trim().split("\n").map(l => JSON.parse(l));
+      expect(log.filter(x => x.source === "acp.runtime" && x.msg.kind === "prompt_result")).toHaveLength(2);
+    });
+    const requests = log.filter(x => x.dir === "out" && x.source === "kimi.acp" && x.msg.method === "session/prompt");
+    const bindings = log.filter(x => x.source === "acp.runtime" && x.msg.kind === "prompt_dispatch").map(x => x.msg);
+    expect(bindings.map(x => x.turnId)).toEqual([first.turnId, second.turnId]);
+    expect(bindings.map(x => x.protocol.requestId)).toEqual(requests.map(x => x.msg.id));
+    expect(bindings.every(x => x.botId === "fixture-bot" && x.protocol.name === "acp" && x.protocol.sessionId === requests[0].msg.params.sessionId)).toBe(true);
+    expect(bindings.every(x => !x.native && !x.protocol.turnId && !x.protocol.itemId)).toBe(true);
+  });
+
+  it("does not attribute foreign or missing-session native updates to Kimi's active prompt", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-kimi-foreign-")); folders.push(dir);
+    const updates = join(dir, "updates.json");
+    writeFileSync(updates, JSON.stringify([
+      { sessionId: "unrelated-native-session", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "FOREIGN-BODY" } } },
+      { sessionId: null, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "MISSING-IDENTITY" } } },
+    ]));
+    const { instance, recorder } = await fixture({ FAKE_ACP_UPDATES_FILE: updates });
+    const threadId = randomUUID();
+    await instance.adapter.sendTurn({ threadId, text: "Progress" });
+    await recorder.until(e => e.type === "turn.completed" && e.threadId === threadId);
+    const visible = JSON.stringify(recorder.events);
+    expect(visible).not.toContain("FOREIGN-BODY");
+    expect(visible).not.toContain("MISSING-IDENTITY");
+    expect(visible).toContain("Truthful progress");
+  });
+});
+
 const SELECT_MODEL_SUPPORT: AcpSupport = {
   driverKind: "selectModelTest",
   displayName: "Select Model Test",

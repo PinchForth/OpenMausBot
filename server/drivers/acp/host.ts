@@ -23,6 +23,7 @@ export interface AcpConnection {
     receive?: (result: any) => void,
     idleMs?: number,
     idleMessage?: string | (() => string),
+    dispatched?: (requestId: number) => void,
   ): Promise<any>;
   readonly lastInboundAt: number;
   touch(): void;
@@ -88,8 +89,8 @@ export class AcpLink implements AcpConnection {
   }
 
   request(method: string, params: unknown, timeoutMs?: number, receive?: (result: any) => void, idleMs?: number,
-    idleMessage?: string | (() => string)): Promise<any> {
-    return this.host.request(this, method, params, timeoutMs, receive, idleMs, idleMessage);
+    idleMessage?: string | (() => string), dispatched?: (requestId: number) => void): Promise<any> {
+    return this.host.request(this, method, params, timeoutMs, receive, idleMs, idleMessage, dispatched);
   }
 
   touch(): void { this.host.touch(this); }
@@ -209,7 +210,7 @@ export class AcpHost {
   }
 
   request(link: AcpLink | null, method: string, params: unknown, timeoutMs?: number, receive?: (result: any) => void,
-    idleMs?: number, idleMessage?: string | (() => string)): Promise<any> {
+    idleMs?: number, idleMessage?: string | (() => string), dispatched?: (requestId: number) => void): Promise<any> {
     return new Promise<any>((resolve, reject) => {
       const id = this.#nextId++;
       if (method === "_x.ai/mcp/list") this.#privateResponses.add(id);
@@ -246,6 +247,8 @@ export class AcpHost {
         armIdle,
       });
       this.write({ jsonrpc: "2.0", id, method, params }, link?.threadId ?? null);
+      // The host owns the serialized id. This observes an attempted write, never provider acceptance or a native turn id.
+      dispatched?.(id);
     });
   }
 

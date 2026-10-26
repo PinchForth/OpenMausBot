@@ -838,6 +838,7 @@ function handle(msg: any) {
         return;
       }
       if (process.env.FAKE_ACP_TEXT_REPLY !== undefined) {
+        emitSessionReports();
         out({ jsonrpc: "2.0", method: "session/update", params: { sessionId: msg.params?.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: process.env.FAKE_ACP_TEXT_REPLY } } } });
         result(msg.id, { stopReason: "end_turn", _meta: { inputTokens: 12, outputTokens: 4 } });
         return;

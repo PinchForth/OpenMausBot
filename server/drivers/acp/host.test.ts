@@ -32,6 +32,21 @@ function hostWith(key: string | null) {
 }
 
 describe("one ACP process for several threads", () => {
+  it("reports the actual serialized prompt request id separately for concurrent sessions", async () => {
+    const h = hostWith("shared");
+    const a = h.link("a", "s-a");
+    const b = h.link("b", "s-b");
+    const observed: Array<[string, number]> = [];
+    const pa = a.request("session/prompt", { sessionId: "s-a" }, undefined, undefined, undefined, undefined,
+      id => observed.push(["a", id]));
+    const pb = b.request("session/prompt", { sessionId: "s-b" }, undefined, undefined, undefined, undefined,
+      id => observed.push(["b", id]));
+    for (const request of h.written) h.say({ jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn" } });
+    await Promise.all([pa, pb]);
+    expect(observed).toEqual(h.written.map(msg => [msg.params.sessionId === "s-a" ? "a" : "b", msg.id]));
+    expect(new Set(observed.map(([, id]) => id)).size).toBe(2);
+  });
+
   it("gives each thread only its own session's traffic, and refuses a request for a session no thread holds", async () => {
     const h = hostWith("shared");
     const a = h.link("a", "s-a");

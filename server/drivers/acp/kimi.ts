@@ -481,6 +481,7 @@ const support: AcpSupport = {
   resolveModels: (env) => mergeLocalInject(readKimiModelCatalog(env), env),
   defaultCli: "kimi",
   nativeSource: "kimi.acp",
+  strictSessionUpdates: true,
   loginNote: "Kimi Code CLI is not signed in — run `kimi login` in a terminal",
 
   install: {
