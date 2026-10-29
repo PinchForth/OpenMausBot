@@ -280,6 +280,41 @@ describe("CodexDriver turns (fake app-server)", () => {
     } finally { unregister(); }
   });
 
+  it.each(["cancellation", "expiry"])("managed Task preflight %s during private setup prevents any late child or public account event", async kind => {
+    let entered!: () => void, release!: (token: string) => void;
+    const pending = new Promise<string>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const token = vi.spyOn(ChatGptPlanAuthController.prototype, "accessToken")
+      .mockResolvedValueOnce("synthetic-initial-plan-token")
+      .mockImplementationOnce(() => { entered(); return pending; })
+      .mockResolvedValue("synthetic-plan-token");
+    const catalog = vi.spyOn(ChatGptPlanAuthController.prototype, "models").mockResolvedValue({
+      default: "gpt-6.1-sol", options: [{ id: "gpt-6.1-sol", label: "GPT-6.1 Sol" }],
+    });
+    await create({ mode: "resume", authMode: "chatgpt-plan", environment: { FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_TASK_ACCOUNT: "text" } });
+    const expiry = new AbortController();
+    const timeout = AbortSignal.timeout;
+    const deadlines = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => ms === 30_000 ? expiry.signal : timeout(ms));
+    const launches = vi.spyOn(procs, "spawnCli");
+    const unregister = registerManagedTaskPreflight(instance, async value => { await value.consultAccount!("Private recovered account fixture"); });
+    try {
+      const input = { threadId: "preflight-account-cancel-before-active", botId: "source-bot", text: "Original work", model: "gpt-6.1-sol" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      await preparing;
+      const beforeCancel = launches.mock.calls.length;
+      if (kind === "cancellation") await instance.adapter.interruptTurn(input.threadId);
+      else expiry.abort();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId);
+      const publicCount = recorder.events.length;
+      release("synthetic-late-plan-token");
+      await pending;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(launches.mock.calls.length).toBe(beforeCancel);
+      expect(recorder.events.length).toBe(publicCount);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+    } finally { release("synthetic-cleanup-token"); unregister(); launches.mockRestore(); token.mockRestore(); catalog.mockRestore(); deadlines.mockRestore(); }
+  });
+
   it("managed Task preflight refuses tool activity in a private account without replaying it", async () => {
     await create({ mode: "resume", environment: { FAKE_CODEX_MCP_OVERRIDES: "1" } });
     const unregister = registerManagedTaskPreflight(instance, async value => { await value.consultAccount!("Fixture account refusing tool output"); });

@@ -648,7 +648,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     type PublicationReference = Parameters<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>[0];
     type PublicationAccount = Awaited<ReturnType<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>>;
     const publicationDispatches = new Map<string, { turnId: string; input: SendTurnInput; sessionId?: string; items: Map<string, { native: NonNullable<RuntimeEvent["native"]>; sha256: string }> }>();
-    const privateAccounts = new Map<string, { reference?: PublicationReference; preflightFor?: Record<string, string>; prompt: string; accept: RuntimeEventListener }>();
+    const privateAccounts = new Map<string, { reference?: PublicationReference; preflightFor?: Record<string, string>; signal?: AbortSignal; prompt: string; accept: RuntimeEventListener }>();
     const emit = (event: RuntimeEvent) => {
       const control = privateAccounts.get(event.threadId);
       if (control) {
@@ -673,10 +673,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     });
 
     const sendTurn = async (turn: SendTurnInput) => {
+      const privateAccount = privateAccounts.get(turn.threadId);
       if (startupModelRefresh) await startupModelRefresh;
       turn = { ...turn, toolScope: assertToolScopeSupported(DRIVER_KIND, turn.toolScope) };
       const generation = planGeneration;
       const assertPlanCurrent = () => {
+        if (privateAccount?.preflightFor &&
+          (privateAccounts.get(turn.threadId) !== privateAccount || privateAccount.signal?.aborted)) {
+          throw new TaskPreflightRefused("Private Task account preparation ended before setup completed.");
+        }
         if (disposed) throw new Error("This provider was removed. Select a connected account and send again.");
         if (planAuth && (planSigningOut || generation !== planGeneration)) throw new Error("The ChatGPT account changed while this message was preparing. Select a connected account and send again.");
       };
@@ -1787,7 +1792,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 const result = new Promise<NativeTaskAccount>((resolve, reject) => {
                   abort = () => reject(new Error("Native Task account cancelled or expired."));
                   signal.addEventListener("abort", abort, { once: true });
-                  privateAccounts.set(privateThread, { prompt, preflightFor: {
+                  privateAccounts.set(privateThread, { prompt, signal, preflightFor: {
                     providerInstanceId: instanceId, botId: binding.botId, threadId, providerDispatchId: turnId,
                     sessionId: binding.sessionId, requestSha256: binding.requestSha256,
                     nativeRequestSha256: binding.nativeRequestSha256,
