@@ -178,6 +178,7 @@ const logStartup = (event: string) => {
   if (process.env.FAKE_CODEX_STARTUP_LOG) appendFileSync(process.env.FAKE_CODEX_STARTUP_LOG, `${JSON.stringify({ pid: process.pid, at: Date.now(), event })}\n`);
 };
 let decision: unknown = null;
+let hookFixtureSteers = 0;
 let experimentalApi = false;
 
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -583,6 +584,14 @@ process.stdin.on("data", (chunk) => {
           break;
         }
         out({ jsonrpc: "2.0", id: msg.id, result: { turnId: nativeTurnId } });
+        if (mode === "native-hook-owner-late-ambiguous") {
+          hookFixtureSteers++;
+          if (hookFixtureSteers === 1) {
+            notify("hook/started", { run: { id: "late-handler:call-source-1", eventName: "preToolUse", status: "running",
+              scope: "turn", executionMode: "sync", handlerType: "command", sourcePath: "/fixture-owned/hooks.json" } });
+          } else notify("hook/completed", { run: { id: "late-handler:call-source-1", status: "completed" } });
+          notify("item/agentMessage/delta", { itemId: "fixture-late", delta: `late hook fixture ${hookFixtureSteers}` });
+        }
         if (mode === "native-hook-owner-invalidated") {
           notify("hook/started", { run: { id: "handler:call-source-1", eventName: "preToolUse", status: "running",
             scope: "turn", executionMode: "sync", handlerType: "command", sourcePath: "/different-owner/hooks.json" } });
@@ -678,7 +687,7 @@ process.stdin.on("data", (chunk) => {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "experimental API required for permissions" } });
           break;
         }
-        if (mode === "native-hook-owner" || mode === "native-hook-owner-ambiguous" || mode === "native-hook-owner-invalidated") {
+        if (mode === "native-hook-owner" || mode === "native-hook-owner-ambiguous" || mode === "native-hook-owner-invalidated" || mode === "native-hook-owner-late-ambiguous") {
           out({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: nativeTurnId } } });
           const run = (id: string) => ({ id, eventName: "preToolUse", status: "running", scope: "turn",
             executionMode: "sync", handlerType: "command", sourcePath: "/fixture-owned/hooks.json" });

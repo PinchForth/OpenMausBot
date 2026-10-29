@@ -210,6 +210,27 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(() => claimCodexPreToolHook(instance.adapter, { ...input, toolUseId: "next-call" })).toThrow();
   });
 
+  it("permanently retires a claimed hook when a second handler arrives late", async () => {
+    await create({ mode: "native-hook-owner-late-ambiguous" });
+    const threadId = "late-handler-hook-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    const input = { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" };
+    const original = claimCodexPreToolHook(instance.adapter, input);
+    const unrelated = claimCodexPreToolHook(instance.adapter, { ...input, toolUseId: "next-call" });
+    expect(currentCodexPreToolHook(instance.adapter, original)).toBe(true);
+    expect(await instance.adapter.steer!(threadId, "start late handler")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "late hook fixture 1");
+    expect(currentCodexPreToolHook(instance.adapter, original)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, unrelated)).toBe(true);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+    expect(await instance.adapter.steer!(threadId, "finish late handler")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "late hook fixture 2");
+    expect(currentCodexPreToolHook(instance.adapter, original)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, unrelated)).toBe(true);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+  });
+
   it("refuses ambiguous native hook runs instead of selecting a convenient owner", async () => {
     await create({ mode: "native-hook-owner-ambiguous" });
     const threadId = "ambiguous-hook-fixture";

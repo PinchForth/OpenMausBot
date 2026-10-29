@@ -1298,6 +1298,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               break;
             }
             if (hookRuns.size >= 1024) { hookOverflow = true; break; }
+            const toolUseId = run.id.slice(run.id.lastIndexOf(":") + 1);
+            for (const [id, prior] of hookRuns) {
+              if (id.slice(id.lastIndexOf(":") + 1) !== toolUseId) continue;
+              prior.claim = undefined;
+              usedHookCalls.add(toolUseId);
+            }
             hookRuns.set(run.id, { sourcePath: run.sourcePath });
             break;
           }
