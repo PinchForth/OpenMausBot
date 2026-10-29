@@ -245,20 +245,24 @@ export function withManagedTaskPreflight(instance: ProviderInstance, turn: SendT
   if (entry.instance !== instance || !turn.botId || !current()) throw new Error("Managed Task owner unavailable.");
   const owner = Object.freeze({ ...source });
   const botId = turn.botId, threadId = turn.threadId, requestSha256 = nativeTaskRequestSha256(turn);
+  const bound: SendTurnInput = { ...turn };
   let consumed = false;
   const assertCurrent = (native: NativeTaskSession) => {
     if (taskPreflightConsumers.get(instance.adapter) !== entry || !current() || native.signal.aborted ||
       native.runtimeOwner !== instance.adapter || native.providerInstanceId !== instance.instanceId || native.botId !== botId || native.threadId !== threadId ||
       !native.sessionId || !native.providerDispatchId || native.requestSha256 !== requestSha256 ||
-      nativeTaskRequestSha256(turn) !== requestSha256) throw new Error("Managed Task preparation lost its owner or request scope.");
+      nativeTaskRequestSha256(turn) !== requestSha256 || nativeTaskRequestSha256(bound) !== requestSha256) {
+      throw new Error("Managed Task preparation lost its owner or request scope.");
+    }
   };
-  return { ...turn, taskPreflight: async native => {
+  bound.taskPreflight = async native => {
     assertCurrent(native);
     if (consumed) throw new Error("Managed Task preparation was already consumed.");
     consumed = true;
     await entry.prepare(Object.freeze({ ...native, ...owner }));
     assertCurrent(native);
-  } };
+  };
+  return bound;
 }
 
 /** An MCP server this machine starts and talks to over stdio. */

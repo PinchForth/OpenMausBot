@@ -1739,14 +1739,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         ];
         const nativeTurnRequest = () => ({ threadId: codexThreadId, input: turnInput, ...approvalParams.turn,
           ...(turn.guestConfined ? { environments: [] } : {}), ...(turn.effort ? { effort: turn.effort } : {}) });
+        let preparedNativeRequest: ReturnType<typeof nativeTurnRequest> | undefined;
         if (turn.taskPreflight !== undefined) {
           try {
             if (typeof turn.taskPreflight !== "function") throw new Error("Task preflight must be runtime-owned.");
             const signal = AbortSignal.any([stopSignal.signal, AbortSignal.timeout(30_000)]);
+            const nativeRequest = structuredClone(nativeTurnRequest());
             const binding = Object.freeze({ runtimeOwner: providerInstance.adapter, providerInstanceId: instanceId, botId: turn.botId ?? "", threadId,
               providerDispatchId: turnId, sessionId: codexThreadId,
               requestSha256: nativeTaskRequestSha256(turn),
-              nativeRequestSha256: createHash("sha256").update(JSON.stringify(nativeTurnRequest())).digest("hex"), signal });
+              nativeRequestSha256: createHash("sha256").update(JSON.stringify(nativeRequest)).digest("hex"), signal });
             const { runtimeOwner: _owner, signal: _signal, ...auditBinding } = binding;
             appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
               ...auditBinding, kind: "task_preflight_requested",
@@ -1760,6 +1762,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             });
             if (signal.aborted || stopRequested || disposed || state.settled || abandoned ||
               active.get(threadId)?.turnId !== turnId) throw new Error("Original dispatch no longer active.");
+            if (nativeTaskRequestSha256(turn) !== binding.requestSha256 ||
+              createHash("sha256").update(JSON.stringify(nativeTurnRequest())).digest("hex") !== binding.nativeRequestSha256) {
+              throw new Error("Task request changed during preparation.");
+            }
+            preparedNativeRequest = nativeRequest;
             appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
               ...auditBinding, kind: "task_preflight_completed",
             } });
@@ -1770,7 +1777,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const startTurn = () => {
           promptSubmitted = true;
           startingNativeTurn = true;
-          return request("turn/start", nativeTurnRequest());
+          return request("turn/start", preparedNativeRequest ?? nativeTurnRequest());
         };
         try {
           await startTurn();

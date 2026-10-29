@@ -214,7 +214,7 @@ describe("CodexDriver turns (fake app-server)", () => {
     } finally { unregister(); }
   });
 
-  it.each(["owner", "request", "registration", "cancel"])("managed Task preflight rejects %s invalidation during preparation", async kind => {
+  it.each(["owner", "request", "bound-request", "registration", "cancel"])("managed Task preflight rejects %s invalidation during preparation", async kind => {
     await create();
     let release!: () => void, entered!: () => void, binding: ManagedTaskPreparation | undefined;
     const waiting = new Promise<void>(resolve => { release = resolve; });
@@ -228,6 +228,7 @@ describe("CodexDriver turns (fake app-server)", () => {
       await called;
       if (kind === "owner") current = false;
       if (kind === "request") input.text = "Different source request";
+      if (kind === "bound-request") turn.effort = "high";
       if (kind === "registration") unregister();
       if (kind === "cancel") await instance.adapter.interruptTurn(input.threadId);
       release();
@@ -235,6 +236,24 @@ describe("CodexDriver turns (fake app-server)", () => {
       expect(nativeRequests(input.threadId)).toHaveLength(0);
       if (kind === "cancel") expect(binding?.signal.aborted).toBe(true);
     } finally { release(); unregister(); }
+  });
+
+  it("managed Task preflight independently rechecks the actual driver input after waiting", async () => {
+    await create();
+    let release!: () => void, entered!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const called = new Promise<void>(resolve => { entered = resolve; });
+    const input: SendTurnInput = { threadId: "preflight-driver-scope-change", botId: "source-bot", text: "Original request", images: [],
+      taskPreflight: async () => { entered(); await waiting; } };
+    try {
+      const started = await instance.adapter.sendTurn(input);
+      await called;
+      input.images!.push({ path: join(scratch, "not-read-after-preflight.png"), mime: "image/png", bytes: 1 });
+      release();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      expect(recorder.events.some(event => event.type === "runtime.error" && event.message.includes("Task preparation refused"))).toBe(true);
+    } finally { release(); }
   });
 
   it("managed Task preflight cannot be copied to a foreign provider, bot, thread or request", async () => {
