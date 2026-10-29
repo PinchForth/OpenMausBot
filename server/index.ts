@@ -206,6 +206,7 @@ import { cliProbeEnvironment, testCliBinary } from "./cli-probe.ts";
 import { buildMentionNotification, buildNotification, buildSpendNotification, type Notification } from "./notify.ts";
 import {
   isModelVariant,
+  withManagedTaskPreflight,
   TurnNotStartedError, TurnAuthenticationRefusedError, TurnUsageLimitRefusedError,
   type ModelSelection,
   type RequestOutcome,
@@ -8815,7 +8816,7 @@ async function startTurn(
       const startupRecovery = cfg.automaticRecovery?.enabled === true && (opts?.automaticRecoveryIndex ?? 0) < ((liveBot ?? bot).fallback?.length || (cfg.automaticRecovery.backup ? 1 : 0));
       const limitedUntil = startupRecovery ? limitClock.blockedUntil(instanceId) : null;
       if (limitedUntil) throw new TurnUsageLimitRefusedError(`limit-${randomUUID()}`, `${engineName(instanceId)} is at its usage limit.`, limitedUntil);
-      const dispatch = await guardTurnDispatch(shareNote.after(quickFallback.sendTurn(instance, {
+      const dispatch = await guardTurnDispatch(shareNote.after(quickFallback.sendTurn(instance, withManagedTaskPreflight(instance, {
         threadId,
         botId: bot.id,
         startupRecovery,
@@ -8840,7 +8841,19 @@ async function startTurn(
         ...(integrations.browser && browserIsThePlace(plan) ? { preloadBrowserTools: true } : {}),
         ...settingsTurnFields(cfg, DATA_DIR, managedPolicy.restrictsMcp()),
         cwd,
-      }, route.quickModel ? { model, own: bot.modelSelection, onFallback: () => store.patchMessage(threadId, userMessage.id, { quickModel: undefined }) } : undefined)), () => !directTurnClaimExists(bot.id, dispatchClaimId, threadId), async () => {
+      }, () => {
+        const taskAnchor = (value: typeof task | undefined) => JSON.stringify([value?.threadId, value?.createdAt, value?.openedBy ?? null]);
+        const sourceAnchor = taskAnchor(task);
+        const sourceHistory = () => createHash("sha256").update(JSON.stringify(store.activePath(threadId))).digest("hex");
+        const historySha256 = sourceHistory();
+        const sourceMessage = store.activePath(threadId).find(message => message.id === userMessage?.id);
+        return { source: { dispatchId: dispatchClaimId, taskCreatedAt: task.createdAt,
+          taskOpenedBySha256: createHash("sha256").update(JSON.stringify(task.openedBy ?? null)).digest("hex"),
+          messageId: sourceMessage?.id ?? "", messageSha256: createHash("sha256").update(JSON.stringify(sourceMessage ?? null)).digest("hex"),
+          historySha256 }, current: () => Boolean(sourceMessage && directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId) &&
+            taskAnchor(store.taskByThread(bot.id, threadId)) === sourceAnchor && sourceHistory() === historySha256) };
+      }),
+      route.quickModel ? { model, own: bot.modelSelection, onFallback: () => store.patchMessage(threadId, userMessage.id, { quickModel: undefined }) } : undefined)), () => !directTurnClaimExists(bot.id, dispatchClaimId, threadId), async () => {
         await instance.adapter.interruptTurn(threadId).catch(() => {});
       });
       if (dispatch.cancelled) {

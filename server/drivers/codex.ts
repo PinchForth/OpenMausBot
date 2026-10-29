@@ -32,7 +32,7 @@ import type {
   SteerOutcome,
   TextGenerationOptions,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { nativeTaskRequestSha256, newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, OFFICIAL_CODEX_PROVIDER, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { codexBackgroundRoute, runCodexBackgroundRoute, runCodexOneShot } from "./codex-background-text.ts";
@@ -63,6 +63,8 @@ import { CALL_TOOL, DESCRIBE_TOOL, SEARCH_TOOL, directoryCallTarget } from "../m
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
+
+class TaskPreflightRefused extends Error {}
 
 
 type NativeHookLocator = { threadId: string; sessionId: string; turnId: string; toolUseId: string };
@@ -1735,25 +1737,45 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           ...(promptText ? [{ type: "text" as const, text: promptText }] : []),
           ...await codexImageInputs(turn.images),
         ];
+        const nativeTurnRequest = () => ({ threadId: codexThreadId, input: turnInput, ...approvalParams.turn,
+          ...(turn.guestConfined ? { environments: [] } : {}), ...(turn.effort ? { effort: turn.effort } : {}) });
+        if (turn.taskPreflight !== undefined) {
+          try {
+            if (typeof turn.taskPreflight !== "function") throw new Error("Task preflight must be runtime-owned.");
+            const signal = AbortSignal.any([stopSignal.signal, AbortSignal.timeout(30_000)]);
+            const binding = Object.freeze({ runtimeOwner: providerInstance.adapter, providerInstanceId: instanceId, botId: turn.botId ?? "", threadId,
+              providerDispatchId: turnId, sessionId: codexThreadId,
+              requestSha256: nativeTaskRequestSha256(turn),
+              nativeRequestSha256: createHash("sha256").update(JSON.stringify(nativeTurnRequest())).digest("hex"), signal });
+            const { runtimeOwner: _owner, signal: _signal, ...auditBinding } = binding;
+            appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
+              ...auditBinding, kind: "task_preflight_requested",
+            } });
+            await new Promise<void>((resolve, reject) => {
+              const aborted = () => reject(new Error("Task preparation cancelled or expired."));
+              if (signal.aborted) { aborted(); return; }
+              signal.addEventListener("abort", aborted, { once: true });
+              Promise.resolve().then(() => turn.taskPreflight!(binding)).then(resolve, reject)
+                .finally(() => signal.removeEventListener("abort", aborted));
+            });
+            if (signal.aborted || stopRequested || disposed || state.settled || abandoned ||
+              active.get(threadId)?.turnId !== turnId) throw new Error("Original dispatch no longer active.");
+            appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
+              ...auditBinding, kind: "task_preflight_completed",
+            } });
+          } catch (cause) {
+            throw new TaskPreflightRefused("Task preparation refused before the native request.", { cause });
+          }
+        }
         const startTurn = () => {
           promptSubmitted = true;
           startingNativeTurn = true;
-          return request("turn/start", {
-            threadId: codexThreadId,
-            input: turnInput,
-            ...approvalParams.turn,
-            // No environment: exec_command, apply_patch and view_image are refused (codex-cli 0.159.0).
-            // Without the experimental API the field is rejected, not ignored.
-            ...(turn.guestConfined ? { environments: [] } : {}),
-            // Spread, not `effort ?? null`: codex-cli 0.146.0 treats null as absent (the thread keeps
-            // its effort), rejects "", and thread/start takes no effort, so a thread keeps its last level.
-            ...(turn.effort ? { effort: turn.effort } : {}),
-          });
+          return request("turn/start", nativeTurnRequest());
         };
         try {
           await startTurn();
         } catch (error) {
-          if (!approvalParams.fallback || !permissionProfileUnsupported(error)) throw error;
+          if (turn.taskPreflight !== undefined || !approvalParams.fallback || !permissionProfileUnsupported(error)) throw error;
           approvalParams = approvalParams.fallback;
           await startTurn();
         }
@@ -1763,11 +1785,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       } catch (e) {
         const failure = e instanceof Error ? e : { text: String(e) };
         const raw = e instanceof Error ? e.message : String(e);
-        const refused = chatgptTurn && loginMark() !== null && codexSignInRefused({ message: raw });
+        const preflightRefused = e instanceof TaskPreflightRefused;
+        const refused = !preflightRefused && chatgptTurn && loginMark() !== null && codexSignInRefused({ message: raw });
         const message = refused ? codexSignInExpired(raw) : codexUserError(raw, route);
-        const needsAuth = refused || /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(raw);
+        const needsAuth = !preflightRefused && (refused || /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(raw));
         const verdict = classifyError(failure);
-        if (!state.settled && !abandoned && !recoveredMissingSession && !stopRequested && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
+        if (!preflightRefused && !state.settled && !abandoned && !recoveredMissingSession && !stopRequested && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
           return relaunch(verdict.reason, message, "rpc_error");
         }
         if (!state.settled && !abandoned) {
