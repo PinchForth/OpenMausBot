@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -139,4 +140,95 @@ describe("omb-hook helper: SessionStart context", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toBe("");
   }, 15_000);
+});
+
+describe("required native pre-effect transport (simulated issuer, not qualification)", () => {
+  const bot = "11111111-1111-4111-8111-111111111111";
+  const thread = "source-task-thread";
+  const scope = "c".repeat(64);
+  const payload = { hook_event_name: "PreToolUse", session_id: "native-source-session", tool_use_id: "call-source-1", tool_name: "mcp__agents__propose_profile", tool_input: { changes: { soul: "original retained" } } };
+  const required = { OMB_CANONICAL_TASK_GUARD_REQUIRED: "1", OMB_HOOK_TOKEN_FILE: tokenFile,
+    OMB_HOOK_BOT_ID: bot, OMB_HOOK_THREAD_ID: thread, OMB_HOOK_TASK_SCOPE_SHA256: scope };
+  const action = JSON.stringify({ event: "PreToolUse", native_session: payload.session_id,
+    tool_input: { changes: { soul: "original retained" } }, tool_name: payload.tool_name });
+  function receipt(changes: Record<string, unknown> = {}) {
+    return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" }, canonicalTaskAdmission: {
+      authorised: true, bot_id: bot, thread_id: thread, scope_sha256: scope, native_session: payload.session_id,
+      action_sha256: createHash("sha256").update(action).digest("hex"), task_id: "22222222-2222-4222-8222-222222222222",
+      work_id: "work-1234567890abcdef", journal: "history/journal/2026-10-29-mira-source-fixture.md",
+      admission_id: "a".repeat(64), commit_sha: "b".repeat(40), tool_use_id: payload.tool_use_id,
+      issued_at: new Date(Date.now()-1000).toISOString(), expires_at: new Date(Date.now()+5000).toISOString(), ...changes } };
+  }
+
+  it("refuses a missing harness rather than treating transport absence as admission", async () => {
+    const result=await run(JSON.stringify(payload),{...required,OMB_HOOK_URL:"http://127.0.0.1:1"});
+    expect(result.code).toBe(2);expect(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(result.stderr).not.toContain("secret-token-123");
+  });
+
+  it("refuses a legacy observation success without a canonical permit", async () => {
+    const url=await listen((_req,res)=>res.end(JSON.stringify({ok:true,hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow"}})));
+    const result=await run(JSON.stringify(payload),{...required,OMB_HOOK_URL:url});
+    expect(result.code).toBe(2);
+  });
+
+  it.each([
+    {bot_id:"33333333-3333-4333-8333-333333333333"},{thread_id:"foreign"},{scope_sha256:"d".repeat(64)},
+    {native_session:"foreign"},{action_sha256:"e".repeat(64)},{tool_use_id:"previous-call"},{authorised:false},
+    {work_id:"work-foreign"},{commit_sha:""},{expires_at:"2000-01-01T00:00:00.000Z"},
+    {issued_at:"2100-01-01T00:00:00.000Z"},
+  ])("refuses a mismatched or stale issuer record %j", async changes => {
+    const url=await listen((_req,res)=>res.end(JSON.stringify(receipt(changes))));
+    expect((await run(JSON.stringify(payload),{...required,OMB_HOOK_URL:url})).code).toBe(2);
+  });
+
+  it("forwards a matching simulated receipt without disclosing it to the model", async () => {
+    const body=receipt();const url=await listen((_req,res)=>res.end(JSON.stringify(body)));
+    const result=await run(JSON.stringify(payload),{...required,OMB_HOOK_URL:url});
+    expect(result.code).toBe(0);expect(JSON.parse(result.stdout)).toEqual({hookSpecificOutput:body.hookSpecificOutput});
+    expect(result.stdout).not.toContain("work-1234567890abcdef");
+  });
+
+  it.each(["garbage",JSON.stringify({hook_event_name:"PreToolUse",tool_input:"x".repeat(1024*1024)})])("refuses malformed or oversized required input", async input => {
+    expect((await run(input,{...required,OMB_HOOK_URL:"http://127.0.0.1:1"})).code).toBe(2);
+  });
+
+  it("refuses required timeout within the finite budget", async () => {
+    const url=await listen(()=>{});
+    const result=await run(JSON.stringify(payload),{...required,OMB_HOOK_URL:url,OMB_HOOK_TIMEOUT_MS:"400"});
+    expect(result.code).toBe(2);expect(result.ms).toBeLessThan(5000);
+  });
+
+  it("refuses issuer changes to the action whose admission was checked", async () => {
+    const body = receipt();
+    const url = await listen((_req, res) => res.end(JSON.stringify({ ...body, hookSpecificOutput: {
+      ...body.hookSpecificOutput, updatedInput: { changes: { soul: "different action" } },
+    } })));
+    expect((await run(JSON.stringify(payload), { ...required, OMB_HOOK_URL: url })).code).toBe(2);
+  });
+
+  it.each(["not-json", "[]", "null"])("refuses malformed issuer output %s", async body => {
+    const url = await listen((_req, res) => res.end(body));
+    expect((await run(JSON.stringify(payload), { ...required, OMB_HOOK_URL: url })).code).toBe(2);
+  });
+
+  it("refuses required redirects without forwarding the private action", async () => {
+    let forwarded = 0;
+    const destination = await listen((_req, res) => { forwarded++; res.end(JSON.stringify(receipt())); });
+    const url = await listen((_req, res) => { res.writeHead(307, { location: destination }); res.end(); });
+    expect((await run(JSON.stringify(payload), { ...required, OMB_HOOK_URL: url })).code).toBe(2);
+    expect(forwarded).toBe(0);
+  });
+
+  it("refuses a missing bearer without sending the private action", async () => {
+    let requests = 0;
+    const url = await listen((_req, res) => { requests++; res.end(JSON.stringify(receipt())); });
+    expect((await run(JSON.stringify(payload), { ...required, OMB_HOOK_URL: url, OMB_HOOK_TOKEN_FILE: join(dir, "absent") })).code).toBe(2);
+    expect(requests).toBe(0);
+  });
+
+  it("preserves observation behavior when the required runtime emits a different hook", async () => {
+    const result=await run(JSON.stringify({hook_event_name:"PostToolUse"}),{...required,OMB_HOOK_URL:"http://127.0.0.1:1"});
+    expect(result.code).toBe(0);expect(result.stdout).toBe("");
+  });
 });
