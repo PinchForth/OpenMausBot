@@ -583,6 +583,17 @@ process.stdin.on("data", (chunk) => {
           break;
         }
         out({ jsonrpc: "2.0", id: msg.id, result: { turnId: nativeTurnId } });
+        if (mode === "native-hook-owner-invalidated") {
+          notify("hook/started", { run: { id: "handler:call-source-1", eventName: "preToolUse", status: "running",
+            scope: "turn", executionMode: "sync", handlerType: "command", sourcePath: "/different-owner/hooks.json" } });
+          notify("item/agentMessage/delta", { itemId: "fixture-conflict", delta: "hook fixture conflict" });
+        }
+        if (mode === "native-hook-owner") {
+          notify("hook/completed", { run: { id: "handler:call-source-1", status: "blocked" } });
+          notify("hook/started", { run: { id: "handler:call-source-1", eventName: "preToolUse", status: "running",
+            scope: "turn", executionMode: "sync", handlerType: "command", sourcePath: "/fixture-owned/hooks.json" } });
+          notify("item/agentMessage/delta", { itemId: "fixture-complete", delta: "hook fixture completed" });
+        }
         break;
       }
       case "turn/interrupt":
@@ -665,6 +676,21 @@ process.stdin.on("data", (chunk) => {
         }
         if (msg.params?.permissions && (!experimentalApi || mode === "config-profile-unsupported")) {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "experimental API required for permissions" } });
+          break;
+        }
+        if (mode === "native-hook-owner" || mode === "native-hook-owner-ambiguous" || mode === "native-hook-owner-invalidated") {
+          out({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: nativeTurnId } } });
+          const run = (id: string) => ({ id, eventName: "preToolUse", status: "running", scope: "turn",
+            executionMode: "sync", handlerType: "command", sourcePath: "/fixture-owned/hooks.json" });
+          notify("hook/started", { run: run("handler:call-source-1") });
+          notify("hook/started", { run: run("handler:call-source-1") });
+          if (mode === "native-hook-owner-ambiguous") notify("hook/started", { run: run("other:call-source-1") });
+          notify("hook/started", { threadId: "foreign-native-thread", run: run("handler:foreign-thread") });
+          notify("hook/started", { turnId: "foreign-native-turn", run: run("handler:foreign-turn") });
+          notify("hook/started", { run: run("handler:completed-call") });
+          notify("hook/completed", { run: { ...run("handler:completed-call"), status: "blocked" } });
+          notify("hook/started", { run: run("handler:next-call") });
+          notify("item/agentMessage/delta", { itemId: "fixture-ready", delta: "hook fixture ready" });
           break;
         }
         // Codex 0.160's ErrorNotification is {error: TurnError, willRetry}; its reconnects come first with willRetry: true.

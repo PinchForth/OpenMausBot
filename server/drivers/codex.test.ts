@@ -13,7 +13,7 @@ import { EventBus } from "../harness/bus.ts";
 import { DATA_DIR, NATIVE_DIR, EVENTS_DIR, ensureDirs } from "../config.ts";
 import { ChatGptPlanAuthController } from "./chatgpt-plan-auth.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { CodexDriver, codexNativeIncomingLogMessage, codexUpdateCommand } from "./codex.ts";
+import { CodexDriver, claimCodexPreToolHook, currentCodexPreToolHook, codexNativeIncomingLogMessage, codexUpdateCommand } from "./codex.ts";
 import { codexCliOverrides } from "./codex-process.ts";
 import { CODEX_SIGN_IN_EXPIRED, codexNotSignedIn, codexSignInRefused, codexUserError } from "./codex-errors.ts";
 import { CODEX_USAGE_LIMIT_REACHED } from "../../shared/codex-usage-limit.ts";
@@ -153,6 +153,69 @@ describe("CodexDriver turns (fake app-server)", () => {
   beforeEach(() => {
     chmodSync(FAKE_CLI, 0o755);
     scratch = mkdtempSync(join(tmpdir(), "omb-codex-test-"));
+  });
+
+  it("claims an observed native hook once and rejects foreign or copied owner evidence", async () => {
+    await create({ mode: "native-hook-owner" });
+    const threadId = "hook-owner-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    const input = { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" };
+    for (const changed of [{ sessionId: "foreign" }, { turnId: "foreign" }, { threadId: "foreign" },
+      { toolUseId: "foreign-thread" }, { toolUseId: "foreign-turn" }, { toolUseId: "completed-call" }, { toolUseId: "prefix:call-source-1" }]) {
+      expect(() => claimCodexPreToolHook(instance.adapter, { ...input, ...changed })).toThrow();
+    }
+    expect(() => claimCodexPreToolHook({ ...instance.adapter }, input)).toThrow();
+    const contenders = await Promise.allSettled([Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input)),
+      Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input))]);
+    expect(contenders.filter(x => x.status === "fulfilled")).toHaveLength(1);
+    expect(contenders.filter(x => x.status === "rejected")).toHaveLength(1);
+    const winner = contenders.find(x => x.status === "fulfilled")!;
+    if (winner.status !== "fulfilled") throw new Error("Fixture claim unavailable");
+    const first = winner.value;
+    expect(first).toMatchObject({ threadId, sessionId: input.sessionId, turnId: input.turnId,
+      toolUseId: input.toolUseId, botId: "11111111-1111-4111-8111-111111111111",
+      promptSha256: createHash("sha256").update("Original task fixture").digest("hex") });
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(currentCodexPreToolHook(instance.adapter, first)).toBe(true);
+    expect(currentCodexPreToolHook(instance.adapter, { ...first })).toBe(false);
+    const repeated = await Promise.allSettled([Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input)),
+      Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input))]);
+    expect(repeated.every(x => x.status === "rejected")).toBe(true);
+    const next = claimCodexPreToolHook(instance.adapter, { ...input, toolUseId: "next-call" });
+    expect(currentCodexPreToolHook(instance.adapter, next)).toBe(true);
+    expect(await instance.adapter.steer!(threadId, "complete fixture hook")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture completed");
+    expect(currentCodexPreToolHook(instance.adapter, first)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, next)).toBe(true);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+    await instance.adapter.interruptTurn(threadId);
+    await recorder.until(e => e.type === "turn.completed");
+    expect(currentCodexPreToolHook(instance.adapter, first)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, next)).toBe(false);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+  });
+
+  it("retires existing hook proof when its native source contradicts the original owner", async () => {
+    await create({ mode: "native-hook-owner-invalidated" });
+    const threadId = "conflicting-hook-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    const input = { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" };
+    const proof = claimCodexPreToolHook(instance.adapter, input);
+    expect(currentCodexPreToolHook(instance.adapter, proof)).toBe(true);
+    expect(await instance.adapter.steer!(threadId, "contradict fixture hook")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture conflict");
+    expect(currentCodexPreToolHook(instance.adapter, proof)).toBe(false);
+    expect(() => claimCodexPreToolHook(instance.adapter, { ...input, toolUseId: "next-call" })).toThrow();
+  });
+
+  it("refuses ambiguous native hook runs instead of selecting a convenient owner", async () => {
+    await create({ mode: "native-hook-owner-ambiguous" });
+    const threadId = "ambiguous-hook-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    expect(() => claimCodexPreToolHook(instance.adapter, { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" })).toThrow(/ambiguous/);
   });
 
   it("keeps an actual dispatch-bound account consultation private and refuses forged references", async () => {

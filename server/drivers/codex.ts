@@ -5,7 +5,7 @@ import { TEAM_TOOLS_FAILED, teamToolsFailed } from "./team-tools.ts";
 // `turn/completed`, approvals arrive as server→client requests, resumeCursor is the codex thread id.
 import { existsSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { codexConfigMcp, codexConfigRunsServer, mountedMcpServerName } from "./codex-mcp-names.ts";
 
@@ -63,6 +63,28 @@ import { CALL_TOOL, DESCRIBE_TOOL, SEARCH_TOOL, directoryCallTarget } from "../m
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
+
+
+type NativeHookLocator = { threadId: string; sessionId: string; turnId: string; toolUseId: string };
+export type CodexPreToolHookClaim = Readonly<{
+  providerInstanceId: string; botId: string; threadId: string; dispatchId: string;
+  sessionId: string; turnId: string; toolUseId: string; hookRunId: string; sourcePath: string;
+  promptSha256: string;
+}>;
+const nativeHookOwners = new WeakMap<ProviderInstance["adapter"], (input: NativeHookLocator) => CodexPreToolHookClaim>();
+const nativeHookClaims = new WeakMap<object, { adapter: ProviderInstance["adapter"]; current: () => boolean }>();
+
+/** A private driver claim identifies one observed hook; it never authorizes an effect or substitutes for Task admission. */
+export function claimCodexPreToolHook(adapter: ProviderInstance["adapter"], input: NativeHookLocator): CodexPreToolHookClaim {
+  const owner = nativeHookOwners.get(adapter);
+  if (!owner) throw new Error("Native hook owner unavailable.");
+  return owner(input);
+}
+
+export function currentCodexPreToolHook(adapter: ProviderInstance["adapter"], claim: object): boolean {
+  const proof = nativeHookClaims.get(claim);
+  return proof?.adapter === adapter && proof.current();
+}
 
 class CodexRpcError extends Error {
   code: unknown;
@@ -618,6 +640,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       asks: Map<string, CodexAsk>;
     }
     const active = new Map<string, Turn>();
+    const hookTurnOwners = new Map<string, (input: NativeHookLocator) => CodexPreToolHookClaim>();
 
     type PublicationReference = Parameters<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>[0];
     type PublicationAccount = Awaited<ReturnType<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>>;
@@ -965,9 +988,36 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         return stopped;
       };
 
+      const hookRuns = new Map<string, { sourcePath: string; claim?: CodexPreToolHookClaim }>();
+      const usedHookCalls = new Set<string>();
+      let hookOverflow = false;
+      const claimHook = (input: NativeHookLocator): CodexPreToolHookClaim => {
+        if (state.settled || abandoned || active.get(threadId)?.turnId !== turnId || hookOverflow || usedHookCalls.size >= 4096 ||
+            !turn.botId || input.threadId !== threadId || input.sessionId !== codexThreadId ||
+            input.turnId !== codexTurnId || !/^[a-zA-Z0-9_.-]{1,256}$/.test(input.toolUseId)) {
+          throw new Error("Native hook does not belong to the active dispatch.");
+        }
+        // Codex 0.164 appends ':' + tool_use_id to the handler run ID; colon-bearing call IDs remain unqualified.
+        const matches = [...hookRuns].filter(([id]) => id.slice(id.lastIndexOf(":") + 1) === input.toolUseId);
+        if (matches.length !== 1 || usedHookCalls.has(input.toolUseId)) throw new Error("Native hook absent, ambiguous or already claimed.");
+        const [hookRunId, run] = matches[0]!;
+        usedHookCalls.add(input.toolUseId);
+        const claim = Object.freeze({ providerInstanceId: instanceId, botId: turn.botId,
+          threadId, dispatchId: turnId, sessionId: codexThreadId!, turnId: codexTurnId!, toolUseId: input.toolUseId,
+          hookRunId, sourcePath: run.sourcePath, promptSha256: createHash("sha256").update(turn.text).digest("hex") });
+        run.claim = claim;
+        nativeHookClaims.set(claim, { adapter: providerInstance.adapter, current: () =>
+          !state.settled && !abandoned && !hookOverflow && active.get(threadId)?.turnId === turnId &&
+          hookRuns.get(hookRunId) === run && run.claim === claim });
+        return claim;
+      };
+      hookTurnOwners.set(threadId, claimHook);
+
       const settle = async (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
         state.settled = true;
+        if (hookTurnOwners.get(threadId) === claimHook) hookTurnOwners.delete(threadId);
+        hookRuns.clear();
         for (const finish of Array.from(asks.values())) finish("deny", "OpenMausBot: the turn ended", "system");
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
@@ -1237,6 +1287,23 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
         if (msg.method.startsWith("item/") && p.item?.type !== "userMessage") state.streamed = true;
         switch (msg.method) {
+          case "hook/started": {
+            const run = p.run;
+            if (run?.eventName !== "preToolUse" || run.status !== "running" || run.scope !== "turn" ||
+                run.executionMode !== "sync" || run.handlerType !== "command" ||
+                typeof run.id !== "string" || !run.id.includes(":") || run.id.length > 1024 ||
+                typeof run.sourcePath !== "string" || run.sourcePath.length > 4096 || !isAbsolute(run.sourcePath)) break;
+            if (hookRuns.has(run.id)) {
+              if (hookRuns.get(run.id)!.sourcePath !== run.sourcePath) hookOverflow = true;
+              break;
+            }
+            if (hookRuns.size >= 1024) { hookOverflow = true; break; }
+            hookRuns.set(run.id, { sourcePath: run.sourcePath });
+            break;
+          }
+          case "hook/completed":
+            if (typeof p.run?.id === "string") hookRuns.delete(p.run.id);
+            break;
           case "guardianWarning":
             if (typeof p.message === "string" && /automatic approval review.*timed out/i.test(p.message)) reviewWarning = true;
             break;
@@ -1827,7 +1894,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     }, options);
   };
 
-  return {
+  const providerInstance: ProviderInstance = {
     instanceId,
     driverKind: DRIVER_KIND,
     displayName: input.displayName,
@@ -1924,7 +1991,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       await planAuth?.dispose();
       await Promise.all([...active.values()].map(({ stop }) => stop()));
       listeners.clear();
+      hookTurnOwners.clear();
     },
   };
+  nativeHookOwners.set(providerInstance.adapter, (input) => {
+    const owner = hookTurnOwners.get(input.threadId);
+    if (!owner) throw new Error("Native hook dispatch unavailable.");
+    return owner(input);
+  });
+  return providerInstance;
 },
 };
