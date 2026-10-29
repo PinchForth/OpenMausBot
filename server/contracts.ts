@@ -127,7 +127,7 @@ export interface SendTurnInput {
    * the turn is stopped first. */
   engineAdmission?: (start: "process" | "session", joining?: number) => Promise<void>;
   /** Private host dependency, never a wire permission or canonical receipt. Awaited before the original native request. */
-  taskPreflight?: (native: NativeTaskSession) => Promise<void>;
+  taskPreflight?: (native: NativeTaskSession) => Promise<void | (() => void)>;
   /** The turn with the conversation replayed inline, sent once on a fresh session when the provider refuses resumeCursor before reading the prompt. */
   recoveryText?: string;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
@@ -211,6 +211,15 @@ export interface NativeTaskSession {
   readonly requestSha256: string;
   readonly nativeRequestSha256: string;
   readonly signal: AbortSignal;
+  /** Private runtime call, valid only inside this preparation. Returns native output, never canonical admission. */
+  readonly consultAccount?: (prompt: string) => Promise<NativeTaskAccount>;
+}
+
+export interface NativeTaskAccount {
+  readonly turnId: string;
+  readonly itemId: string;
+  readonly native: { sessionId: string; turnId: string; itemId: string };
+  readonly text: string;
 }
 
 export type ManagedTaskPreparation = Readonly<NativeTaskSession & ManagedTaskSource>;
@@ -259,8 +268,16 @@ export function withManagedTaskPreflight(instance: ProviderInstance, turn: SendT
     assertCurrent(native);
     if (consumed) throw new Error("Managed Task preparation was already consumed.");
     consumed = true;
-    await entry.prepare(Object.freeze({ ...native, ...owner }));
+    await entry.prepare(Object.freeze({ ...native, ...owner,
+      ...(native.consultAccount ? { consultAccount: async (prompt: string) => {
+        assertCurrent(native);
+        const result = await native.consultAccount!(prompt);
+        assertCurrent(native);
+        return result;
+      } } : {}),
+    }));
     assertCurrent(native);
+    return () => assertCurrent(native);
   };
   return bound;
 }

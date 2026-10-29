@@ -528,6 +528,7 @@ process.stdin.on("data", (chunk) => {
                   },
                 }),
               developer_instructions: process.env.FAKE_CODEX_INSTRUCTIONS ?? null,
+              ...(process.argv.includes('web_search="disabled"') ? { web_search: "disabled" } : {}),
               shell_environment_policy: shellEnvironmentPolicy(),
               features: Object.fromEntries(process.argv.flatMap((arg, index) => {
                 const match = process.argv[index - 1] === "-c" ? /^features\.(\w+)=(true|false)$/.exec(arg) : null;
@@ -542,6 +543,10 @@ process.stdin.on("data", (chunk) => {
         dump();
         developerInstructions = msg.params?.developerInstructions ?? "";
         resumedThread = msg.params?.threadId ?? null;
+        if (process.env.FAKE_CODEX_TASK_ACCOUNT_FOREIGN_SESSION && process.argv.includes("features.shell_tool=false")) {
+          threadReply({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "foreign-account-session" } } });
+          break;
+        }
         if (process.env.FAKE_CODEX_RESUME_ERROR) {
           out({ jsonrpc: "2.0", id: msg.id, error: JSON.parse(process.env.FAKE_CODEX_RESUME_ERROR) });
         } else if (process.env.FAKE_CODEX_ARCHIVED && !unarchived) {
@@ -634,6 +639,13 @@ process.stdin.on("data", (chunk) => {
         dump();
         logStartup("turn/start");
         nativeThreadId = msg.params?.threadId ?? nativeThreadId;
+        if (process.env.FAKE_CODEX_TASK_ACCOUNT && process.argv.includes("features.shell_tool=false")) {
+          out({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: nativeTurnId } } });
+          if (process.env.FAKE_CODEX_TASK_ACCOUNT === "hang") break;
+          notify("item/completed", { item: { id: "task-account-item", type: "agentMessage", text: "Synthetic native account: " + msg.params.input[0].text } });
+          notify("turn/completed", { turn: { status: "completed" } });
+          break;
+        }
         // Counts turn launches only, not the catalog spawn during create().
         if (process.env.FAKE_CODEX_LAUNCH_CRASHES && process.env.FAKE_CODEX_STATE) {
           let launched = 0;
