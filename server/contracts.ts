@@ -1,5 +1,6 @@
 // Ported from upstream's provider contracts with Promises for Effect and listeners for Stream; shapes and names are kept.
 
+import { createHash } from "node:crypto";
 import type { ApprovalMode } from "../shared/approval-mode.ts";
 import type { ToolScope } from "../shared/tool-scope.ts";
 import type { EffortLevel } from "../shared/wire.ts";
@@ -125,6 +126,8 @@ export interface SendTurnInput {
    * adds this thread's session to the running one whose pid is `joining` ("session"); rejects with TurnNotStartedError when
    * the turn is stopped first. */
   engineAdmission?: (start: "process" | "session", joining?: number) => Promise<void>;
+  /** Private host dependency, never a wire permission or canonical receipt. Awaited before the original native request. */
+  taskPreflight?: (native: NativeTaskSession) => Promise<void | (() => void)>;
   /** The turn with the conversation replayed inline, sent once on a fresh session when the provider refuses resumeCursor before reading the prompt. */
   recoveryText?: string;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
@@ -187,6 +190,96 @@ export interface SendTurnInput {
   mcpCallTimeoutMs?: number;
   /** Times an API-model turn that answers after a failed tool call is sent back to re-run it (`loopGuard.correctiveRounds`); never after a denial. */
   toolErrorCorrectiveRounds?: number;
+}
+
+export interface ManagedTaskSource {
+  readonly dispatchId: string;
+  readonly taskCreatedAt: number;
+  readonly taskOpenedBySha256: string;
+  readonly messageId: string;
+  readonly messageSha256: string;
+  readonly historySha256: string;
+}
+
+export interface NativeTaskSession {
+  readonly runtimeOwner: ProviderAdapter;
+  readonly providerInstanceId: string;
+  readonly botId: string;
+  readonly threadId: string;
+  readonly providerDispatchId: string;
+  readonly sessionId: string;
+  readonly requestSha256: string;
+  readonly nativeRequestSha256: string;
+  readonly signal: AbortSignal;
+  /** Private runtime call, valid only inside this preparation. Returns native output, never canonical admission. */
+  readonly consultAccount?: (prompt: string) => Promise<NativeTaskAccount>;
+}
+
+export interface NativeTaskAccount {
+  readonly turnId: string;
+  readonly itemId: string;
+  readonly native: { sessionId: string; turnId: string; itemId: string };
+  readonly text: string;
+}
+
+export type ManagedTaskPreparation = Readonly<NativeTaskSession & ManagedTaskSource>;
+type TaskPreflightConsumer = (binding: ManagedTaskPreparation) => Promise<void>;
+const taskPreflightConsumers = new WeakMap<ProviderAdapter, { instance: ProviderInstance; prepare: TaskPreflightConsumer }>();
+
+/** Register only from the runtime composition root. A callback is a dependency, not independently qualified canonical admission. */
+export function registerManagedTaskPreflight(instance: ProviderInstance, prepare: TaskPreflightConsumer): () => void {
+  if (instance.adapter.provider !== "codex" || typeof prepare !== "function" || taskPreflightConsumers.has(instance.adapter)) {
+    throw new Error("Managed Task preflight registration unavailable.");
+  }
+  const entry = { instance, prepare };
+  taskPreflightConsumers.set(instance.adapter, entry);
+  return () => { if (taskPreflightConsumers.get(instance.adapter) === entry) taskPreflightConsumers.delete(instance.adapter); };
+}
+
+export function nativeTaskRequestSha256(turn: SendTurnInput): string {
+  return createHash("sha256").update(JSON.stringify([
+    turn.threadId, turn.botId, turn.text, turn.recalled, turn.system, turn.systemStable, turn.systemVolatile,
+    turn.model, turn.effort, turn.variant, turn.approvalMode, turn.toolScope, turn.cwd, turn.images,
+    turn.guestConfined, turn.resumeCursor, turn.sessionReset, turn.recoveryText, turn.transcript,
+    turn.integrations, turn.mcpFromUserConfig, turn.userSkillsDir, turn.mcpCallTimeoutMs,
+  ])).digest("hex");
+}
+
+/** Bind the host's actual Task/message/dispatch closure to this exact instance and immutable request scope. */
+export function withManagedTaskPreflight(instance: ProviderInstance, turn: SendTurnInput,
+  bind: () => { source: ManagedTaskSource; current: () => boolean }): SendTurnInput {
+  const entry = taskPreflightConsumers.get(instance.adapter);
+  if (!entry) return turn;
+  const { source, current } = bind();
+  if (entry.instance !== instance || !turn.botId || !current()) throw new Error("Managed Task owner unavailable.");
+  const owner = Object.freeze({ ...source });
+  const botId = turn.botId, threadId = turn.threadId, requestSha256 = nativeTaskRequestSha256(turn);
+  const bound: SendTurnInput = { ...turn };
+  let consumed = false;
+  const assertCurrent = (native: NativeTaskSession) => {
+    if (taskPreflightConsumers.get(instance.adapter) !== entry || !current() || native.signal.aborted ||
+      native.runtimeOwner !== instance.adapter || native.providerInstanceId !== instance.instanceId || native.botId !== botId || native.threadId !== threadId ||
+      !native.sessionId || !native.providerDispatchId || native.requestSha256 !== requestSha256 ||
+      nativeTaskRequestSha256(turn) !== requestSha256 || nativeTaskRequestSha256(bound) !== requestSha256) {
+      throw new Error("Managed Task preparation lost its owner or request scope.");
+    }
+  };
+  bound.taskPreflight = async native => {
+    assertCurrent(native);
+    if (consumed) throw new Error("Managed Task preparation was already consumed.");
+    consumed = true;
+    await entry.prepare(Object.freeze({ ...native, ...owner,
+      ...(native.consultAccount ? { consultAccount: async (prompt: string) => {
+        assertCurrent(native);
+        const result = await native.consultAccount!(prompt);
+        assertCurrent(native);
+        return result;
+      } } : {}),
+    }));
+    assertCurrent(native);
+    return () => assertCurrent(native);
+  };
+  return bound;
 }
 
 /** An MCP server this machine starts and talks to over stdio. */

@@ -5,7 +5,7 @@ import { TEAM_TOOLS_FAILED, teamToolsFailed } from "./team-tools.ts";
 // `turn/completed`, approvals arrive as server→client requests, resumeCursor is the codex thread id.
 import { existsSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { codexConfigMcp, codexConfigRunsServer, mountedMcpServerName } from "./codex-mcp-names.ts";
 
@@ -22,6 +22,7 @@ import { isReservedMcpEnvEntry } from "../mcp-registry.ts";
 import type {
   DriverCreateInput,
   McpServerSpec,
+  NativeTaskAccount,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -32,7 +33,7 @@ import type {
   SteerOutcome,
   TextGenerationOptions,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { nativeTaskRequestSha256, newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, OFFICIAL_CODEX_PROVIDER, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { codexBackgroundRoute, runCodexBackgroundRoute, runCodexOneShot } from "./codex-background-text.ts";
@@ -63,6 +64,30 @@ import { CALL_TOOL, DESCRIBE_TOOL, SEARCH_TOOL, directoryCallTarget } from "../m
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
+
+class TaskPreflightRefused extends Error {}
+
+
+type NativeHookLocator = { threadId: string; sessionId: string; turnId: string; toolUseId: string };
+export type CodexPreToolHookClaim = Readonly<{
+  providerInstanceId: string; botId: string; threadId: string; dispatchId: string;
+  sessionId: string; turnId: string; toolUseId: string; hookRunId: string; sourcePath: string;
+  promptSha256: string;
+}>;
+const nativeHookOwners = new WeakMap<ProviderInstance["adapter"], (input: NativeHookLocator) => CodexPreToolHookClaim>();
+const nativeHookClaims = new WeakMap<object, { adapter: ProviderInstance["adapter"]; current: () => boolean }>();
+
+/** A private driver claim identifies one observed hook; it never authorizes an effect or substitutes for Task admission. */
+export function claimCodexPreToolHook(adapter: ProviderInstance["adapter"], input: NativeHookLocator): CodexPreToolHookClaim {
+  const owner = nativeHookOwners.get(adapter);
+  if (!owner) throw new Error("Native hook owner unavailable.");
+  return owner(input);
+}
+
+export function currentCodexPreToolHook(adapter: ProviderInstance["adapter"], claim: object): boolean {
+  const proof = nativeHookClaims.get(claim);
+  return proof?.adapter === adapter && proof.current();
+}
 
 class CodexRpcError extends Error {
   code: unknown;
@@ -618,11 +643,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       asks: Map<string, CodexAsk>;
     }
     const active = new Map<string, Turn>();
+    const hookTurnOwners = new Map<string, (input: NativeHookLocator) => CodexPreToolHookClaim>();
 
     type PublicationReference = Parameters<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>[0];
     type PublicationAccount = Awaited<ReturnType<NonNullable<ProviderInstance["adapter"]["consumePublicationContext"]>>>;
     const publicationDispatches = new Map<string, { turnId: string; input: SendTurnInput; sessionId?: string; items: Map<string, { native: NonNullable<RuntimeEvent["native"]>; sha256: string }> }>();
-    const privateAccounts = new Map<string, { reference: PublicationReference; prompt: string; accept: RuntimeEventListener }>();
+    const privateAccounts = new Map<string, { reference?: PublicationReference; preflightFor?: Record<string, string>; signal?: AbortSignal; prompt: string; accept: RuntimeEventListener }>();
     const emit = (event: RuntimeEvent) => {
       const control = privateAccounts.get(event.threadId);
       if (control) {
@@ -647,10 +673,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     });
 
     const sendTurn = async (turn: SendTurnInput) => {
+      const privateAccount = privateAccounts.get(turn.threadId);
       if (startupModelRefresh) await startupModelRefresh;
       turn = { ...turn, toolScope: assertToolScopeSupported(DRIVER_KIND, turn.toolScope) };
       const generation = planGeneration;
       const assertPlanCurrent = () => {
+        if (privateAccount?.preflightFor &&
+          (privateAccounts.get(turn.threadId) !== privateAccount || privateAccount.signal?.aborted)) {
+          throw new TaskPreflightRefused("Private Task account preparation ended before setup completed.");
+        }
         if (disposed) throw new Error("This provider was removed. Select a connected account and send again.");
         if (planAuth && (planSigningOut || generation !== planGeneration)) throw new Error("The ChatGPT account changed while this message was preparing. Select a connected account and send again.");
       };
@@ -686,6 +717,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       let recoveredMissingSession = false;
       let loginRaceRetried = false;
       const stopSignal = new AbortController();
+      let preparedTask: { sessionId: string; requestSha256: string; request: Record<string, unknown>; verify?: () => void } | undefined;
       const { threadId } = turn;
       const approvalMode: ApprovalMode = turn.approvalMode ?? (config.fullAuto ? "full" : "ask");
       for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
@@ -848,6 +880,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }, "bot"));
 
       let abandoned = false;
+      let retiredForAccount = false;
       let codexThreadId: string | null = null;
       let codexTurnId: string | null = null;
       let startingNativeTurn = false;
@@ -917,6 +950,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                   botId: turn.botId ?? null, cwd: turn.cwd ?? null,
                   native: { sessionId: codexThreadId, turnId: codexTurnId },
                   accountFor: account?.reference ?? null,
+                  ...(account?.preflightFor ? { taskAccountFor: account.preflightFor } : {}),
                   promptSha256: account ? createHash("sha256").update(account.prompt).digest("hex") : null,
                 } });
                 startingNativeTurn = false;
@@ -965,9 +999,36 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         return stopped;
       };
 
+      const hookRuns = new Map<string, { sourcePath: string; claim?: CodexPreToolHookClaim }>();
+      const usedHookCalls = new Set<string>();
+      let hookOverflow = false;
+      const claimHook = (input: NativeHookLocator): CodexPreToolHookClaim => {
+        if (state.settled || abandoned || active.get(threadId)?.turnId !== turnId || hookOverflow || usedHookCalls.size >= 4096 ||
+            !turn.botId || input.threadId !== threadId || input.sessionId !== codexThreadId ||
+            input.turnId !== codexTurnId || !/^[a-zA-Z0-9_.-]{1,256}$/.test(input.toolUseId)) {
+          throw new Error("Native hook does not belong to the active dispatch.");
+        }
+        // Codex 0.164 appends ':' + tool_use_id to the handler run ID; colon-bearing call IDs remain unqualified.
+        const matches = [...hookRuns].filter(([id]) => id.slice(id.lastIndexOf(":") + 1) === input.toolUseId);
+        if (matches.length !== 1 || usedHookCalls.has(input.toolUseId)) throw new Error("Native hook absent, ambiguous or already claimed.");
+        const [hookRunId, run] = matches[0]!;
+        usedHookCalls.add(input.toolUseId);
+        const claim = Object.freeze({ providerInstanceId: instanceId, botId: turn.botId,
+          threadId, dispatchId: turnId, sessionId: codexThreadId!, turnId: codexTurnId!, toolUseId: input.toolUseId,
+          hookRunId, sourcePath: run.sourcePath, promptSha256: createHash("sha256").update(turn.text).digest("hex") });
+        run.claim = claim;
+        nativeHookClaims.set(claim, { adapter: providerInstance.adapter, current: () =>
+          !state.settled && !abandoned && !hookOverflow && active.get(threadId)?.turnId === turnId &&
+          hookRuns.get(hookRunId) === run && run.claim === claim });
+        return claim;
+      };
+      hookTurnOwners.set(threadId, claimHook);
+
       const settle = async (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
         state.settled = true;
+        if (hookTurnOwners.get(threadId) === claimHook) hookTurnOwners.delete(threadId);
+        hookRuns.clear();
         for (const finish of Array.from(asks.values())) finish("deny", "OpenMausBot: the turn ended", "system");
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
@@ -985,6 +1046,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
       // Retires this process before anything async, so a late rpc timer rejection cannot relaunch again.
       const relaunch = async (reason: string, failure: string, failedStop: string) => {
+        if (privateAccounts.get(threadId)?.preflightFor) return settle(false, failedStop);
         const delayMs = computeBackoff(attempt);
         attempt++;
         emit({ ...base(threadId, turnId), type: "turn.retrying", attempt, delayMs, reason });
@@ -1237,6 +1299,29 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
         if (msg.method.startsWith("item/") && p.item?.type !== "userMessage") state.streamed = true;
         switch (msg.method) {
+          case "hook/started": {
+            const run = p.run;
+            if (run?.eventName !== "preToolUse" || run.status !== "running" || run.scope !== "turn" ||
+                run.executionMode !== "sync" || run.handlerType !== "command" ||
+                typeof run.id !== "string" || !run.id.includes(":") || run.id.length > 1024 ||
+                typeof run.sourcePath !== "string" || run.sourcePath.length > 4096 || !isAbsolute(run.sourcePath)) break;
+            if (hookRuns.has(run.id)) {
+              if (hookRuns.get(run.id)!.sourcePath !== run.sourcePath) hookOverflow = true;
+              break;
+            }
+            if (hookRuns.size >= 1024) { hookOverflow = true; break; }
+            const toolUseId = run.id.slice(run.id.lastIndexOf(":") + 1);
+            for (const [id, prior] of hookRuns) {
+              if (id.slice(id.lastIndexOf(":") + 1) !== toolUseId) continue;
+              prior.claim = undefined;
+              usedHookCalls.add(toolUseId);
+            }
+            hookRuns.set(run.id, { sourcePath: run.sourcePath });
+            break;
+          }
+          case "hook/completed":
+            if (typeof p.run?.id === "string") hookRuns.delete(p.run.id);
+            break;
           case "guardianWarning":
             if (typeof p.message === "string" && /automatic approval review.*timed out/i.test(p.message)) reviewWarning = true;
             break;
@@ -1479,7 +1564,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           recentStderr ? `: ${recentStderr.slice(-300)}` : hadStreamedOutput && stderr.trim() ? "; no stderr after the last app-server output" : ""
         }`;
         // Relaunch only when turn/start was never acknowledged: a replay could re-run tools the user saw.
-        if (!stopRequested && codexTurnId === null && earlyNotifications.length === 0 && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1) {
+        if (!privateAccounts.get(threadId)?.preflightFor && !stopRequested && codexTurnId === null && earlyNotifications.length === 0 && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1) {
           void relaunch(verdict.reason, exitMessage, "exit_before_result").catch(() => {});
           return;
         }
@@ -1549,6 +1634,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         if (turn.guestConfined && !codexShellDisabled(effectiveConfig)) {
           throw new Error(`This Codex could not turn its shell off, so it can't run this turn. Update Codex, or switch this bot to Claude.${turn.confinedWhy ? ` ${turn.confinedWhy}` : ""}`);
         }
+        if (privateAccounts.get(threadId)?.preflightFor &&
+          (effectiveConfig as { web_search?: unknown } | null)?.web_search !== "disabled") {
+          throw new Error("Native account web restriction was not confirmed. No prompt was sent.");
+        }
         const stableInstructions = typeof turn.systemStable === "string" && typeof turn.systemVolatile === "string"
           ? turn.systemStable
           : null;
@@ -1572,7 +1661,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           : config.authMode === "chatgpt-plan"
             ? { model: turn.model, modelProvider: "openai_chatgpt_plan" }
             : decodeCodexSelection(turn.model);
-        const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
+        const cursor = preparedTask?.sessionId ?? (typeof turn.resumeCursor === "string" ? turn.resumeCursor : null);
         let startedModel: string | null = null;
         let resumedNativeThread = false;
         let rebuiltFromReplay = false;
@@ -1641,6 +1730,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           startedModel = started?.model ?? null;
         }
         if (!codexThreadId) throw new Error("Codex did not return a native thread id");
+        const accountOwner = privateAccounts.get(threadId)?.preflightFor;
+        if (accountOwner && codexThreadId !== accountOwner.sessionId) {
+          throw new TaskPreflightRefused("Native account resumed a different session. No account prompt was sent.");
+        }
         const { deliverVolatile, hadVolatile, commitVolatile } = await syncCodexInstructions(
           threadId,
           codexThreadId,
@@ -1662,25 +1755,124 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           ...(promptText ? [{ type: "text" as const, text: promptText }] : []),
           ...await codexImageInputs(turn.images),
         ];
+        const nativeTurnRequest = () => ({ threadId: codexThreadId, input: turnInput, ...approvalParams.turn,
+          ...(turn.guestConfined ? { environments: [] } : {}), ...(turn.effort ? { effort: turn.effort } : {}) });
+        let preparedNativeRequest: Record<string, unknown> | undefined = preparedTask?.request;
+        let verifyPreparation = preparedTask?.verify;
+        if (preparedTask && (nativeTaskRequestSha256(turn) !== preparedTask.requestSha256 || codexThreadId !== preparedTask.sessionId)) {
+          throw new TaskPreflightRefused("Prepared Task no longer matches its native owner or request.");
+        }
+        if (turn.taskPreflight !== undefined && !preparedTask) {
+          try {
+            if (typeof turn.taskPreflight !== "function") throw new Error("Task preflight must be runtime-owned.");
+            const signal = AbortSignal.any([stopSignal.signal, AbortSignal.timeout(30_000)]);
+            const nativeRequest = structuredClone(nativeTurnRequest());
+            const accountCalls = new Map<string, Promise<NativeTaskAccount>>();
+            let accountQueue: Promise<unknown> = Promise.resolve();
+            let preparing = true;
+            const consultAccount = (prompt: string): Promise<NativeTaskAccount> => {
+              if (!preparing || signal.aborted || stopRequested || disposed || state.settled ||
+                active.get(threadId)?.turnId !== turnId || nativeTaskRequestSha256(turn) !== binding.requestSha256 ||
+                !prompt || Buffer.byteLength(prompt) > 131072) return Promise.reject(new Error("Native Task account unavailable."));
+              const previous = accountCalls.get(prompt);
+              if (previous) return previous.then(value => structuredClone(value));
+              if (accountCalls.size >= 2) return Promise.reject(new Error("Native Task account limit reached."));
+              // The waiting original process has not received turn/start. Retire it before another
+              // process opens the same session, then reload that session for the original request.
+              const result = accountQueue.then(async () => {
+                if (!preparing || signal.aborted) throw new Error("Native Task account cancelled.");
+                retiredForAccount = true;
+                abandoned = true;
+                if (!(await terminate())) throw new Error("Original native process did not retire.");
+                releaseSlot();
+                if (signal.aborted) throw new Error("Native Task account cancelled.");
+                const privateThread = newId();
+                const items: NativeTaskAccount[] = [];
+                let abort!: () => void;
+                const result = new Promise<NativeTaskAccount>((resolve, reject) => {
+                  abort = () => reject(new Error("Native Task account cancelled or expired."));
+                  signal.addEventListener("abort", abort, { once: true });
+                  privateAccounts.set(privateThread, { prompt, signal, preflightFor: {
+                    providerInstanceId: instanceId, botId: binding.botId, threadId, providerDispatchId: turnId,
+                    sessionId: binding.sessionId, requestSha256: binding.requestSha256,
+                    nativeRequestSha256: binding.nativeRequestSha256,
+                  }, accept: event => {
+                    if (event.type === "item.completed" && event.itemType === "assistant_text" && event.itemId && event.native && event.turnId) {
+                      items.push({ turnId: event.turnId, itemId: event.itemId, native: event.native, text: event.text });
+                    }
+                    if (event.type === "request.opened" || (event.type === "item.started" && event.itemType === "tool")) {
+                      reject(new Error("Native Task account attempted an external effect."));
+                    }
+                    if (event.type === "turn.completed") {
+                      if (event.ok && items.length === 1 && items[0].native.sessionId === binding.sessionId) resolve(items[0]);
+                      else reject(new Error("Native Task account did not complete once in its original session."));
+                    }
+                  } });
+                  void sendTurn({ ...turn, threadId: privateThread, taskPreflight: undefined,
+                    text: prompt, resumeCursor: binding.sessionId, sessionReset: false,
+                    recoveryText: undefined, transcript: undefined, images: undefined,
+                    approvalMode: "ask", integrations: {}, toolScope: { allow: ["native:*"] }, guestConfined: true,
+                  }).catch(reject);
+                });
+                try { return await result; }
+                finally {
+                  signal.removeEventListener("abort", abort);
+                  await active.get(privateThread)?.stop();
+                  privateAccounts.delete(privateThread);
+                }
+              });
+              accountQueue = result;
+              accountCalls.set(prompt, result);
+              return result.then(value => structuredClone(value));
+            };
+            const binding = Object.freeze({ runtimeOwner: providerInstance.adapter, providerInstanceId: instanceId, botId: turn.botId ?? "", threadId,
+              providerDispatchId: turnId, sessionId: codexThreadId,
+              requestSha256: nativeTaskRequestSha256(turn),
+              nativeRequestSha256: createHash("sha256").update(JSON.stringify(nativeRequest)).digest("hex"), signal, consultAccount });
+            const { runtimeOwner: _owner, signal: _signal, consultAccount: _consult, ...auditBinding } = binding;
+            appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
+              ...auditBinding, kind: "task_preflight_requested",
+            } });
+            try { await new Promise<void>((resolve, reject) => {
+              const aborted = () => reject(new Error("Task preparation cancelled or expired."));
+              if (signal.aborted) { aborted(); return; }
+              signal.addEventListener("abort", aborted, { once: true });
+              Promise.resolve().then(async () => {
+                const verify = await turn.taskPreflight!(binding);
+                if (typeof verify === "function") verifyPreparation = verify;
+                await Promise.all(accountCalls.values());
+              }).then(resolve, reject)
+                .finally(() => signal.removeEventListener("abort", aborted));
+            }); } finally { preparing = false; }
+            if (signal.aborted || stopRequested || disposed || state.settled || (abandoned && !retiredForAccount) ||
+              active.get(threadId)?.turnId !== turnId) throw new Error("Original dispatch no longer active.");
+            if (nativeTaskRequestSha256(turn) !== binding.requestSha256 ||
+              createHash("sha256").update(JSON.stringify(nativeTurnRequest())).digest("hex") !== binding.nativeRequestSha256) {
+              throw new Error("Task request changed during preparation.");
+            }
+            preparedNativeRequest = nativeRequest;
+            appendNative(threadId, { dir: "out", source: "codex.runtime", msg: {
+              ...auditBinding, kind: "task_preflight_completed",
+            } });
+            if (retiredForAccount) {
+              preparedTask = { sessionId: binding.sessionId, requestSha256: binding.requestSha256, request: nativeRequest, verify: verifyPreparation };
+              return launchAttempt(attempt);
+            }
+          } catch (cause) {
+            throw new TaskPreflightRefused("Task preparation refused before the native request.", { cause });
+          }
+        }
         const startTurn = () => {
+          try { verifyPreparation?.(); }
+          catch (cause) { throw new TaskPreflightRefused("Prepared Task lost its source owner before dispatch.", { cause }); }
           promptSubmitted = true;
           startingNativeTurn = true;
-          return request("turn/start", {
-            threadId: codexThreadId,
-            input: turnInput,
-            ...approvalParams.turn,
-            // No environment: exec_command, apply_patch and view_image are refused (codex-cli 0.159.0).
-            // Without the experimental API the field is rejected, not ignored.
-            ...(turn.guestConfined ? { environments: [] } : {}),
-            // Spread, not `effort ?? null`: codex-cli 0.146.0 treats null as absent (the thread keeps
-            // its effort), rejects "", and thread/start takes no effort, so a thread keeps its last level.
-            ...(turn.effort ? { effort: turn.effort } : {}),
-          });
+          return request("turn/start", preparedNativeRequest ?? nativeTurnRequest());
         };
         try {
           await startTurn();
         } catch (error) {
-          if (!approvalParams.fallback || !permissionProfileUnsupported(error)) throw error;
+          if (turn.taskPreflight !== undefined || !approvalParams.fallback || !permissionProfileUnsupported(error)) throw error;
           approvalParams = approvalParams.fallback;
           await startTurn();
         }
@@ -1690,14 +1882,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       } catch (e) {
         const failure = e instanceof Error ? e : { text: String(e) };
         const raw = e instanceof Error ? e.message : String(e);
-        const refused = chatgptTurn && loginMark() !== null && codexSignInRefused({ message: raw });
+        const preflightRefused = e instanceof TaskPreflightRefused;
+        const refused = !preflightRefused && chatgptTurn && loginMark() !== null && codexSignInRefused({ message: raw });
         const message = refused ? codexSignInExpired(raw) : codexUserError(raw, route);
-        const needsAuth = refused || /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(raw);
+        const needsAuth = !preflightRefused && (refused || /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(raw));
         const verdict = classifyError(failure);
-        if (!state.settled && !abandoned && !recoveredMissingSession && !stopRequested && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
+        if (!privateAccounts.get(threadId)?.preflightFor && !preflightRefused && !state.settled && !abandoned && !recoveredMissingSession && !stopRequested && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
           return relaunch(verdict.reason, message, "rpc_error");
         }
-        if (!state.settled && !abandoned) {
+        if (!state.settled && (!abandoned || retiredForAccount)) {
           if (refused) loginRefused();
           emit({
             ...base(threadId, turnId),
@@ -1827,7 +2020,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     }, options);
   };
 
-  return {
+  const providerInstance: ProviderInstance = {
     instanceId,
     driverKind: DRIVER_KIND,
     displayName: input.displayName,
@@ -1924,7 +2117,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       await planAuth?.dispose();
       await Promise.all([...active.values()].map(({ stop }) => stop()));
       listeners.clear();
+      hookTurnOwners.clear();
     },
   };
+  nativeHookOwners.set(providerInstance.adapter, (input) => {
+    const owner = hookTurnOwners.get(input.threadId);
+    if (!owner) throw new Error("Native hook dispatch unavailable.");
+    return owner(input);
+  });
+  return providerInstance;
 },
 };

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -8,12 +8,13 @@ import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
+import type { ManagedTaskPreparation, ManagedTaskSource, ProviderInstance, RuntimeEvent, SendTurnInput } from "../contracts.ts";
+import { nativeTaskRequestSha256, registerManagedTaskPreflight, withManagedTaskPreflight } from "../contracts.ts";
 import { EventBus } from "../harness/bus.ts";
 import { DATA_DIR, NATIVE_DIR, EVENTS_DIR, ensureDirs } from "../config.ts";
 import { ChatGptPlanAuthController } from "./chatgpt-plan-auth.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { CodexDriver, codexNativeIncomingLogMessage, codexUpdateCommand } from "./codex.ts";
+import { CodexDriver, claimCodexPreToolHook, currentCodexPreToolHook, codexNativeIncomingLogMessage, codexUpdateCommand } from "./codex.ts";
 import { codexCliOverrides } from "./codex-process.ts";
 import { CODEX_SIGN_IN_EXPIRED, codexNotSignedIn, codexSignInRefused, codexUserError } from "./codex-errors.ts";
 import { CODEX_USAGE_LIMIT_REACHED } from "../../shared/codex-usage-limit.ts";
@@ -153,6 +154,431 @@ describe("CodexDriver turns (fake app-server)", () => {
   beforeEach(() => {
     chmodSync(FAKE_CLI, 0o755);
     scratch = mkdtempSync(join(tmpdir(), "omb-codex-test-"));
+    mkdirSync(NATIVE_DIR, { recursive: true });
+  });
+
+  const taskSource = (): ManagedTaskSource => ({ dispatchId: "source-dispatch", taskCreatedAt: 1234,
+    taskOpenedBySha256: "a".repeat(64), messageId: "source-user-message", messageSha256: "b".repeat(64), historySha256: "c".repeat(64) });
+  const nativeRequests = (threadId: string) => existsSync(join(NATIVE_DIR, threadId + ".ndjson"))
+    ? readFileSync(join(NATIVE_DIR, threadId + ".ndjson"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line)).filter(row => row.dir === "out" && row.msg?.method === "turn/start") : [];
+
+  const taskAccounts = (threadId: string) => readdirSync(NATIVE_DIR).filter(name => name.endsWith(".ndjson"))
+    .map(name => readFileSync(join(NATIVE_DIR, name), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)))
+    .filter(rows => rows.some(row => row.msg?.taskAccountFor?.threadId === threadId));
+
+  it("managed Task preflight delivers one retained private native account before reloading the original session", async () => {
+    const dump = join(scratch, "account-child.json");
+    await create({ mode: "resume", environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex"), FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_DUMP: dump, FAKE_CODEX_TASK_ACCOUNT: "text" } });
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    let binding!: ManagedTaskPreparation, first: unknown, second: unknown, confined: any, consultationError = "";
+    const unregister = registerManagedTaskPreflight(instance, async value => {
+      binding = value;
+      [first, second] = await Promise.all([value.consultAccount!("Recovered original journal package fixture"),
+        value.consultAccount!("Recovered original journal package fixture")]).catch(error => { consultationError = String(error); throw error; });
+      confined = JSON.parse(readFileSync(dump, "utf8"));
+      entered(); await wait;
+    });
+    const input: SendTurnInput = { threadId: "preflight-native-account", botId: "source-bot", text: "Original work", model: "fixture-model", effort: "high", approvalMode: "full" };
+    try {
+      const started = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      await Promise.race([ready, recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId)
+        .then(() => { throw new Error(consultationError || "Original dispatch ended before its account was ready."); })]);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      expect(first).toEqual(second);
+      expect(first).not.toBe(second);
+      expect(first).toMatchObject({ native: { sessionId: binding.sessionId }, text: expect.any(String) });
+      expect(taskAccounts(input.threadId)).toHaveLength(1);
+      expect(confined.argv).toContain("features.shell_tool=false");
+      expect(confined.calls.find((call: any) => call.method === "turn/start").params).toMatchObject({ threadId: binding.sessionId, environments: [], effort: "high" });
+      expect(confined.calls.find((call: any) => call.method === "thread/resume").params.model).toBe(input.model);
+      expect(recorder.events.some(event => event.type === "item.completed")).toBe(false);
+      release();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      expect(nativeRequests(input.threadId)).toHaveLength(1);
+      expect(nativeRequests(input.threadId)[0].msg.params).toMatchObject({ threadId: binding.sessionId, input: [{ type: "text", text: input.text }], effort: "high" });
+      const final = JSON.parse(readFileSync(dump, "utf8"));
+      expect(final.argv).not.toContain("features.shell_tool=false");
+      expect(final.calls.find((call: any) => call.method === "thread/resume").params.threadId).toBe(binding.sessionId);
+      await expect(binding.consultAccount!("Recovered original journal package fixture")).rejects.toThrow();
+    } finally { release(); unregister(); }
+  });
+
+  it("managed Task preflight refuses an account when native confinement cannot be confirmed", async () => {
+    await create({ mode: "resume", environment: { FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_IGNORE_FEATURES: "1" } });
+    const unregister = registerManagedTaskPreflight(instance, async value => { await value.consultAccount!("Fixture recovered journal"); });
+    try {
+      const input = { threadId: "preflight-account-unconfined", botId: "source-bot", text: "Must not run" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      expect(await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId)).toMatchObject({ ok: false });
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      expect(taskAccounts(input.threadId)).toHaveLength(0);
+      expect(recorder.events.some(event => event.type === "turn.retrying")).toBe(false);
+    } finally { unregister(); }
+  });
+
+  it("managed Task preflight retains account output through a simulated writer retry without repeating the native call", async () => {
+    await create({ mode: "resume", environment: { FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_TASK_ACCOUNT: "text" } });
+    let account: unknown, observed: unknown, firstAttempt = true;
+    const unregister = registerManagedTaskPreflight(instance, async value => {
+      account = await value.consultAccount!("Retained journal and failures fixture");
+      try { if (firstAttempt) { firstAttempt = false; throw new Error("synthetic writer unavailable"); } }
+      catch { observed = await value.consultAccount!("Retained journal and failures fixture"); }
+    });
+    try {
+      const input = { threadId: "preflight-account-observation-retry", botId: "source-bot", text: "Remaining original work" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      expect(await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId)).toMatchObject({ ok: true });
+      expect(observed).toEqual(account);
+      expect(taskAccounts(input.threadId)).toHaveLength(1);
+      expect(nativeRequests(input.threadId)).toHaveLength(1);
+    } finally { unregister(); }
+  });
+
+  it("managed Task preflight never delivers the account prompt to a foreign resumed session", async () => {
+    const dump = join(scratch, "foreign-account-child.json");
+    await create({ mode: "resume", environment: { FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_DUMP: dump, FAKE_CODEX_TASK_ACCOUNT_FOREIGN_SESSION: "1" } });
+    const unregister = registerManagedTaskPreflight(instance, async value => { await value.consultAccount!("Must stay private to original owner"); });
+    try {
+      const input = { threadId: "preflight-account-foreign-session", botId: "source-bot", text: "Must stay held" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      expect(await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId)).toMatchObject({ ok: false });
+      expect(JSON.parse(readFileSync(dump, "utf8")).calls.some((call: any) => call.method === "turn/start")).toBe(false);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+    } finally { unregister(); }
+  });
+
+  it("managed Task preflight rechecks the source owner after the original session reload", async () => {
+    await create({ mode: "resume", environment: { FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_TASK_ACCOUNT: "text", FAKE_CODEX_STARTUP_DELAY_MS: "120" } });
+    let current = true;
+    const unregister = registerManagedTaskPreflight(instance, async value => {
+      await value.consultAccount!("Original journal fixture");
+      setTimeout(() => { current = false; }, 20);
+    });
+    try {
+      const input = { threadId: "preflight-account-reload-owner", botId: "source-bot", text: "Must stay held" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => current })));
+      expect(await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId)).toMatchObject({ ok: false });
+      expect(taskAccounts(input.threadId)).toHaveLength(1);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+    } finally { unregister(); }
+  });
+
+  it("managed Task preflight cancellation stops a pending private account and never starts original work", async () => {
+    await create({ mode: "resume", environment: { FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_TASK_ACCOUNT: "hang" } });
+    const unregister = registerManagedTaskPreflight(instance, async value => { await value.consultAccount!("Recovery fixture"); });
+    try {
+      const input = { threadId: "preflight-account-cancel", botId: "source-bot", text: "Must not run" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      await vi.waitFor(() => expect(taskAccounts(input.threadId)).toHaveLength(1));
+      await instance.adapter.interruptTurn(input.threadId);
+      expect(await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId)).toMatchObject({ ok: false });
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      expect(recorder.events.some(event => event.type === "turn.retrying")).toBe(false);
+    } finally { unregister(); }
+  });
+
+  it.each(["cancellation", "expiry"])("managed Task preflight %s during private setup prevents any late child or public account event", async kind => {
+    let entered!: () => void, release!: (token: string) => void;
+    const pending = new Promise<string>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const token = vi.spyOn(ChatGptPlanAuthController.prototype, "accessToken")
+      .mockResolvedValueOnce("synthetic-initial-plan-token")
+      .mockImplementationOnce(() => { entered(); return pending; })
+      .mockResolvedValue("synthetic-plan-token");
+    const catalog = vi.spyOn(ChatGptPlanAuthController.prototype, "models").mockResolvedValue({
+      default: "gpt-6.1-sol", options: [{ id: "gpt-6.1-sol", label: "GPT-6.1 Sol" }],
+    });
+    await create({ mode: "resume", authMode: "chatgpt-plan", environment: { FAKE_CODEX_MCP_OVERRIDES: "1", FAKE_CODEX_TASK_ACCOUNT: "text" } });
+    const expiry = new AbortController();
+    const timeout = AbortSignal.timeout;
+    const deadlines = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => ms === 30_000 ? expiry.signal : timeout(ms));
+    const launches = vi.spyOn(procs, "spawnCli");
+    const unregister = registerManagedTaskPreflight(instance, async value => { await value.consultAccount!("Private recovered account fixture"); });
+    try {
+      const input = { threadId: "preflight-account-cancel-before-active", botId: "source-bot", text: "Original work", model: "gpt-6.1-sol" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      await preparing;
+      const beforeCancel = launches.mock.calls.length;
+      if (kind === "cancellation") await instance.adapter.interruptTurn(input.threadId);
+      else expiry.abort();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId);
+      const publicCount = recorder.events.length;
+      release("synthetic-late-plan-token");
+      await pending;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(launches.mock.calls.length).toBe(beforeCancel);
+      expect(recorder.events.length).toBe(publicCount);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+    } finally { release("synthetic-cleanup-token"); unregister(); launches.mockRestore(); token.mockRestore(); catalog.mockRestore(); deadlines.mockRestore(); }
+  });
+
+  it("managed Task preflight refuses tool activity in a private account without replaying it", async () => {
+    await create({ mode: "resume", environment: { FAKE_CODEX_MCP_OVERRIDES: "1" } });
+    const unregister = registerManagedTaskPreflight(instance, async value => { await value.consultAccount!("Fixture account refusing tool output"); });
+    try {
+      const input = { threadId: "preflight-account-tool-refusal", botId: "source-bot", text: "Must not run" };
+      const result = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true })));
+      expect(await recorder.until(event => event.type === "turn.completed" && event.turnId === result.turnId)).toMatchObject({ ok: false });
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      expect(taskAccounts(input.threadId)).toHaveLength(1);
+      expect(recorder.events.some(event => event.type === "item.started")).toBe(false);
+    } finally { unregister(); }
+  });
+
+  it("managed Task preflight waits on the actual session before one unchanged native request", async () => {
+    await create();
+    let release!: () => void, entered!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const called = new Promise<void>(resolve => { entered = resolve; });
+    const bindings: ManagedTaskPreparation[] = [];
+    const unregister = registerManagedTaskPreflight(instance, async binding => { bindings.push(binding); entered(); await waiting; });
+    const source = { ...taskSource() };
+    const turn = withManagedTaskPreflight(instance, { threadId: "preflight-success", botId: "actual-source-bot",
+      text: "Original Task request", model: "gpt-5.4", approvalMode: "ask", cwd: scratch }, () => ({ source, current: () => true }));
+    try {
+      const started = await instance.adapter.sendTurn(turn);
+      await called;
+      expect(nativeRequests(turn.threadId)).toHaveLength(0);
+      expect(bindings).toHaveLength(1);
+      expect(bindings[0]).toMatchObject({ ...source, providerInstanceId: instance.instanceId, botId: turn.botId,
+        threadId: turn.threadId, sessionId: "codex-thread-1", providerDispatchId: started.turnId });
+      expect(Object.isFrozen(bindings[0])).toBe(true);
+      expect(bindings[0].nativeRequestSha256).toMatch(/^[a-f0-9]{64}$/);
+      source.messageId = "changed-caller-copy";
+      release();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      const requests = nativeRequests(turn.threadId);
+      expect(requests, JSON.stringify(recorder.events.filter(event => event.type === "runtime.error"))).toHaveLength(1);
+      expect(requests[0].msg.params).toMatchObject({ threadId: "codex-thread-1",
+        input: [{ type: "text", text: "Original Task request" }], approvalPolicy: "on-request" });
+      expect(bindings[0].messageId).toBe("source-user-message");
+      expect(bindings[0].nativeRequestSha256).toBe(createHash("sha256").update(JSON.stringify(requests[0].msg.params)).digest("hex"));
+      const duplicate = await instance.adapter.sendTurn(turn);
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === duplicate.turnId);
+      expect(nativeRequests(turn.threadId)).toHaveLength(1);
+      expect(bindings).toHaveLength(1);
+    } finally { release(); unregister(); }
+  });
+
+  it("managed Task preflight refusal is terminal without transient retries or original dispatch", async () => {
+    await create();
+    const prepare = vi.fn(async () => { throw new Error("connection reset timeout"); });
+    const unregister = registerManagedTaskPreflight(instance, prepare);
+    const turn = withManagedTaskPreflight(instance, { threadId: "preflight-refused", botId: "source-bot", text: "Retain original" },
+      () => ({ source: taskSource(), current: () => true }));
+    try {
+      const started = await instance.adapter.sendTurn(turn);
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(nativeRequests(turn.threadId)).toHaveLength(0);
+      expect(recorder.events.some(event => event.type === "runtime.error" && event.message.includes("Task preparation refused"))).toBe(true);
+      expect(recorder.events.some(event => event.type === "turn.retrying")).toBe(false);
+    } finally { unregister(); }
+  });
+
+  it.each(["owner", "request", "bound-request", "registration", "cancel"])("managed Task preflight rejects %s invalidation during preparation", async kind => {
+    await create();
+    let release!: () => void, entered!: () => void, binding: ManagedTaskPreparation | undefined;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const called = new Promise<void>(resolve => { entered = resolve; });
+    const unregister = registerManagedTaskPreflight(instance, async value => { binding = value; entered(); await waiting; });
+    let current = true;
+    const input: SendTurnInput = { threadId: "preflight-invalid-" + kind, botId: "source-bot", text: "Original task" };
+    const turn = withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => current }));
+    try {
+      const started = await instance.adapter.sendTurn(turn);
+      await called;
+      if (kind === "owner") current = false;
+      if (kind === "request") input.text = "Different source request";
+      if (kind === "bound-request") turn.effort = "high";
+      if (kind === "registration") unregister();
+      if (kind === "cancel") await instance.adapter.interruptTurn(input.threadId);
+      release();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      if (kind === "cancel") expect(binding?.signal.aborted).toBe(true);
+    } finally { release(); unregister(); }
+  });
+
+  it("managed Task preflight independently rechecks the actual driver input after waiting", async () => {
+    await create();
+    let release!: () => void, entered!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const called = new Promise<void>(resolve => { entered = resolve; });
+    const input: SendTurnInput = { threadId: "preflight-driver-scope-change", botId: "source-bot", text: "Original request", images: [],
+      taskPreflight: async () => { entered(); await waiting; } };
+    try {
+      const started = await instance.adapter.sendTurn(input);
+      await called;
+      input.images!.push({ path: join(scratch, "not-read-after-preflight.png"), mime: "image/png", bytes: 1 });
+      release();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      expect(recorder.events.some(event => event.type === "runtime.error" && event.message.includes("Task preparation refused"))).toBe(true);
+    } finally { release(); }
+  });
+
+  it("managed Task preflight cannot be copied to a foreign provider, bot, thread or request", async () => {
+    await create();
+    const prepare = vi.fn(async () => {}), unregister = registerManagedTaskPreflight(instance, prepare);
+    const input: SendTurnInput = { threadId: "preflight-owner", botId: "source-bot", text: "Original" };
+    const bound = withManagedTaskPreflight(instance, input, () => ({ source: taskSource(), current: () => true }));
+    try {
+      const fakeNative = { runtimeOwner: instance.adapter, providerInstanceId: instance.instanceId, botId: input.botId!, threadId: input.threadId,
+        providerDispatchId: "fixture-dispatch", sessionId: "fixture-session", requestSha256: nativeTaskRequestSha256(input),
+        nativeRequestSha256: "d".repeat(64), signal: new AbortController().signal };
+      for (const changed of [{ requestSha256: "wrong-scope" }, { runtimeOwner: { ...instance.adapter } },
+        { botId: "foreign-bot" }, { threadId: "foreign-thread" }, { providerInstanceId: "foreign-instance" }]) {
+        await expect(bound.taskPreflight!({ ...fakeNative, ...changed })).rejects.toThrow();
+      }
+      expect(() => withManagedTaskPreflight({ ...instance }, input, () => ({ source: taskSource(), current: () => true }))).toThrow();
+      const started = await instance.adapter.sendTurn({ ...bound, threadId: "preflight-copied", text: "Different" });
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(nativeRequests("preflight-copied")).toHaveLength(0);
+    } finally { unregister(); }
+  });
+
+  it("managed Task preflight leaves an unregistered source unchanged and rejects serialized callbacks", async () => {
+    await create();
+    const input: SendTurnInput = { threadId: "preflight-unregistered", botId: "source-bot", text: "Original" };
+    expect(withManagedTaskPreflight(instance, input, () => { throw new Error("Unregistered source read"); })).toBe(input);
+    const started = await instance.adapter.sendTurn({ ...input, taskPreflight: {} as SendTurnInput["taskPreflight"] });
+    await recorder.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+    expect(nativeRequests(input.threadId)).toHaveLength(0);
+  });
+
+  it("managed Task preflight rejects another real driver instance even with the same public instance id", async () => {
+    await create();
+    const prepare = vi.fn(async () => {}), unregister = registerManagedTaskPreflight(instance, prepare);
+    const bound = withManagedTaskPreflight(instance, { threadId: "preflight-foreign-adapter", botId: "source-bot", text: "Original" },
+      () => ({ source: taskSource(), current: () => true }));
+    const foreign = await CodexDriver.create({ instanceId: instance.instanceId, displayName: "Foreign fixture",
+      environment: {}, enabled: true, config: { cli: FAKE_CLI, fullAuto: false } });
+    const events = recordEvents(foreign.adapter);
+    try {
+      const started = await foreign.adapter.sendTurn(bound);
+      await events.until(event => event.type === "turn.completed" && event.turnId === started.turnId);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(nativeRequests(bound.threadId)).toHaveLength(0);
+    } finally { unregister(); events.stop(); await foreign.dispose(); }
+  });
+
+  it("managed Task preflight expires a suspended dependency and can retry the retained Task without replay", async () => {
+    await create();
+    const expiry = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(expiry.signal);
+    let entered!: () => void;
+    const called = new Promise<void>(resolve => { entered = resolve; });
+    const scopes: ManagedTaskPreparation[] = [];
+    const unregister = registerManagedTaskPreflight(instance, async binding => {
+      scopes.push(binding);
+      if (scopes.length === 1) { entered(); await new Promise<void>(() => {}); }
+    });
+    const input: SendTurnInput = { threadId: "preflight-expiry-recovery", botId: "source-bot", text: "Retained original Task" };
+    try {
+      const first = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input,
+        () => ({ source: taskSource(), current: () => true })));
+      await called;
+      expect(AbortSignal.timeout).toHaveBeenCalledWith(30_000);
+      expiry.abort();
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === first.turnId);
+      expect(nativeRequests(input.threadId)).toHaveLength(0);
+      const second = await instance.adapter.sendTurn(withManagedTaskPreflight(instance, input,
+        () => ({ source: { ...taskSource(), dispatchId: "recovery-dispatch" }, current: () => true })));
+      await recorder.until(event => event.type === "turn.completed" && event.turnId === second.turnId);
+      expect(nativeRequests(input.threadId)).toHaveLength(1);
+      expect(scopes).toHaveLength(2);
+      expect(scopes[1]).toMatchObject({ botId: scopes[0].botId, threadId: scopes[0].threadId,
+        taskCreatedAt: scopes[0].taskCreatedAt, messageId: scopes[0].messageId, historySha256: scopes[0].historySha256 });
+    } finally { unregister(); }
+  });
+
+  it("claims an observed native hook once and rejects foreign or copied owner evidence", async () => {
+    await create({ mode: "native-hook-owner" });
+    const threadId = "hook-owner-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    const input = { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" };
+    for (const changed of [{ sessionId: "foreign" }, { turnId: "foreign" }, { threadId: "foreign" },
+      { toolUseId: "foreign-thread" }, { toolUseId: "foreign-turn" }, { toolUseId: "completed-call" }, { toolUseId: "prefix:call-source-1" }]) {
+      expect(() => claimCodexPreToolHook(instance.adapter, { ...input, ...changed })).toThrow();
+    }
+    expect(() => claimCodexPreToolHook({ ...instance.adapter }, input)).toThrow();
+    const contenders = await Promise.allSettled([Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input)),
+      Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input))]);
+    expect(contenders.filter(x => x.status === "fulfilled")).toHaveLength(1);
+    expect(contenders.filter(x => x.status === "rejected")).toHaveLength(1);
+    const winner = contenders.find(x => x.status === "fulfilled")!;
+    if (winner.status !== "fulfilled") throw new Error("Fixture claim unavailable");
+    const first = winner.value;
+    expect(first).toMatchObject({ threadId, sessionId: input.sessionId, turnId: input.turnId,
+      toolUseId: input.toolUseId, botId: "11111111-1111-4111-8111-111111111111",
+      promptSha256: createHash("sha256").update("Original task fixture").digest("hex") });
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(currentCodexPreToolHook(instance.adapter, first)).toBe(true);
+    expect(currentCodexPreToolHook(instance.adapter, { ...first })).toBe(false);
+    const repeated = await Promise.allSettled([Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input)),
+      Promise.resolve().then(() => claimCodexPreToolHook(instance.adapter, input))]);
+    expect(repeated.every(x => x.status === "rejected")).toBe(true);
+    const next = claimCodexPreToolHook(instance.adapter, { ...input, toolUseId: "next-call" });
+    expect(currentCodexPreToolHook(instance.adapter, next)).toBe(true);
+    expect(await instance.adapter.steer!(threadId, "complete fixture hook")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture completed");
+    expect(currentCodexPreToolHook(instance.adapter, first)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, next)).toBe(true);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+    await instance.adapter.interruptTurn(threadId);
+    await recorder.until(e => e.type === "turn.completed");
+    expect(currentCodexPreToolHook(instance.adapter, first)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, next)).toBe(false);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+  });
+
+  it("retires existing hook proof when its native source contradicts the original owner", async () => {
+    await create({ mode: "native-hook-owner-invalidated" });
+    const threadId = "conflicting-hook-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    const input = { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" };
+    const proof = claimCodexPreToolHook(instance.adapter, input);
+    expect(currentCodexPreToolHook(instance.adapter, proof)).toBe(true);
+    expect(await instance.adapter.steer!(threadId, "contradict fixture hook")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture conflict");
+    expect(currentCodexPreToolHook(instance.adapter, proof)).toBe(false);
+    expect(() => claimCodexPreToolHook(instance.adapter, { ...input, toolUseId: "next-call" })).toThrow();
+  });
+
+  it("permanently retires a claimed hook when a second handler arrives late", async () => {
+    await create({ mode: "native-hook-owner-late-ambiguous" });
+    const threadId = "late-handler-hook-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    const input = { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" };
+    const original = claimCodexPreToolHook(instance.adapter, input);
+    const unrelated = claimCodexPreToolHook(instance.adapter, { ...input, toolUseId: "next-call" });
+    expect(currentCodexPreToolHook(instance.adapter, original)).toBe(true);
+    expect(await instance.adapter.steer!(threadId, "start late handler")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "late hook fixture 1");
+    expect(currentCodexPreToolHook(instance.adapter, original)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, unrelated)).toBe(true);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+    expect(await instance.adapter.steer!(threadId, "finish late handler")).toBe("steered");
+    await recorder.until(e => e.type === "content.delta" && e.delta === "late hook fixture 2");
+    expect(currentCodexPreToolHook(instance.adapter, original)).toBe(false);
+    expect(currentCodexPreToolHook(instance.adapter, unrelated)).toBe(true);
+    expect(() => claimCodexPreToolHook(instance.adapter, input)).toThrow();
+  });
+
+  it("refuses ambiguous native hook runs instead of selecting a convenient owner", async () => {
+    await create({ mode: "native-hook-owner-ambiguous" });
+    const threadId = "ambiguous-hook-fixture";
+    await instance.adapter.sendTurn({ threadId, botId: "11111111-1111-4111-8111-111111111111", text: "Original task fixture", cwd: scratch });
+    await recorder.until(e => e.type === "content.delta" && e.delta === "hook fixture ready");
+    expect(() => claimCodexPreToolHook(instance.adapter, { threadId, sessionId: "codex-thread-1", turnId: "turn-1", toolUseId: "call-source-1" })).toThrow(/ambiguous/);
   });
 
   it("keeps an actual dispatch-bound account consultation private and refuses forged references", async () => {

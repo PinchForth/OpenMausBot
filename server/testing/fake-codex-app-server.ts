@@ -178,6 +178,7 @@ const logStartup = (event: string) => {
   if (process.env.FAKE_CODEX_STARTUP_LOG) appendFileSync(process.env.FAKE_CODEX_STARTUP_LOG, `${JSON.stringify({ pid: process.pid, at: Date.now(), event })}\n`);
 };
 let decision: unknown = null;
+let hookFixtureSteers = 0;
 let experimentalApi = false;
 
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -527,6 +528,7 @@ process.stdin.on("data", (chunk) => {
                   },
                 }),
               developer_instructions: process.env.FAKE_CODEX_INSTRUCTIONS ?? null,
+              ...(process.argv.includes('web_search="disabled"') ? { web_search: "disabled" } : {}),
               shell_environment_policy: shellEnvironmentPolicy(),
               features: Object.fromEntries(process.argv.flatMap((arg, index) => {
                 const match = process.argv[index - 1] === "-c" ? /^features\.(\w+)=(true|false)$/.exec(arg) : null;
@@ -541,6 +543,10 @@ process.stdin.on("data", (chunk) => {
         dump();
         developerInstructions = msg.params?.developerInstructions ?? "";
         resumedThread = msg.params?.threadId ?? null;
+        if (process.env.FAKE_CODEX_TASK_ACCOUNT_FOREIGN_SESSION && process.argv.includes("features.shell_tool=false")) {
+          threadReply({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "foreign-account-session" } } });
+          break;
+        }
         if (process.env.FAKE_CODEX_RESUME_ERROR) {
           out({ jsonrpc: "2.0", id: msg.id, error: JSON.parse(process.env.FAKE_CODEX_RESUME_ERROR) });
         } else if (process.env.FAKE_CODEX_ARCHIVED && !unarchived) {
@@ -583,6 +589,25 @@ process.stdin.on("data", (chunk) => {
           break;
         }
         out({ jsonrpc: "2.0", id: msg.id, result: { turnId: nativeTurnId } });
+        if (mode === "native-hook-owner-late-ambiguous") {
+          hookFixtureSteers++;
+          if (hookFixtureSteers === 1) {
+            notify("hook/started", { run: { id: "late-handler:call-source-1", eventName: "preToolUse", status: "running",
+              scope: "turn", executionMode: "sync", handlerType: "command", sourcePath: "/fixture-owned/hooks.json" } });
+          } else notify("hook/completed", { run: { id: "late-handler:call-source-1", status: "completed" } });
+          notify("item/agentMessage/delta", { itemId: "fixture-late", delta: `late hook fixture ${hookFixtureSteers}` });
+        }
+        if (mode === "native-hook-owner-invalidated") {
+          notify("hook/started", { run: { id: "handler:call-source-1", eventName: "preToolUse", status: "running",
+            scope: "turn", executionMode: "sync", handlerType: "command", sourcePath: "/different-owner/hooks.json" } });
+          notify("item/agentMessage/delta", { itemId: "fixture-conflict", delta: "hook fixture conflict" });
+        }
+        if (mode === "native-hook-owner") {
+          notify("hook/completed", { run: { id: "handler:call-source-1", status: "blocked" } });
+          notify("hook/started", { run: { id: "handler:call-source-1", eventName: "preToolUse", status: "running",
+            scope: "turn", executionMode: "sync", handlerType: "command", sourcePath: "/fixture-owned/hooks.json" } });
+          notify("item/agentMessage/delta", { itemId: "fixture-complete", delta: "hook fixture completed" });
+        }
         break;
       }
       case "turn/interrupt":
@@ -614,6 +639,13 @@ process.stdin.on("data", (chunk) => {
         dump();
         logStartup("turn/start");
         nativeThreadId = msg.params?.threadId ?? nativeThreadId;
+        if (process.env.FAKE_CODEX_TASK_ACCOUNT && process.argv.includes("features.shell_tool=false")) {
+          out({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: nativeTurnId } } });
+          if (process.env.FAKE_CODEX_TASK_ACCOUNT === "hang") break;
+          notify("item/completed", { item: { id: "task-account-item", type: "agentMessage", text: "Synthetic native account: " + msg.params.input[0].text } });
+          notify("turn/completed", { turn: { status: "completed" } });
+          break;
+        }
         // Counts turn launches only, not the catalog spawn during create().
         if (process.env.FAKE_CODEX_LAUNCH_CRASHES && process.env.FAKE_CODEX_STATE) {
           let launched = 0;
@@ -665,6 +697,21 @@ process.stdin.on("data", (chunk) => {
         }
         if (msg.params?.permissions && (!experimentalApi || mode === "config-profile-unsupported")) {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "experimental API required for permissions" } });
+          break;
+        }
+        if (mode === "native-hook-owner" || mode === "native-hook-owner-ambiguous" || mode === "native-hook-owner-invalidated" || mode === "native-hook-owner-late-ambiguous") {
+          out({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: nativeTurnId } } });
+          const run = (id: string) => ({ id, eventName: "preToolUse", status: "running", scope: "turn",
+            executionMode: "sync", handlerType: "command", sourcePath: "/fixture-owned/hooks.json" });
+          notify("hook/started", { run: run("handler:call-source-1") });
+          notify("hook/started", { run: run("handler:call-source-1") });
+          if (mode === "native-hook-owner-ambiguous") notify("hook/started", { run: run("other:call-source-1") });
+          notify("hook/started", { threadId: "foreign-native-thread", run: run("handler:foreign-thread") });
+          notify("hook/started", { turnId: "foreign-native-turn", run: run("handler:foreign-turn") });
+          notify("hook/started", { run: run("handler:completed-call") });
+          notify("hook/completed", { run: { ...run("handler:completed-call"), status: "blocked" } });
+          notify("hook/started", { run: run("handler:next-call") });
+          notify("item/agentMessage/delta", { itemId: "fixture-ready", delta: "hook fixture ready" });
           break;
         }
         // Codex 0.160's ErrorNotification is {error: TurnError, willRetry}; its reconnects come first with willRetry: true.
