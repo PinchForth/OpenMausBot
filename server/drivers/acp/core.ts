@@ -24,6 +24,7 @@ import { runAcpOneShot } from "./background-text.ts";
 import { acpCapabilities } from "./capabilities.ts";
 import { acpNativeLogMessage } from "./tool-log.ts";
 import { stripLeakedSystemHarnessMessages } from "../../../shared/system-message-guard.ts";
+import { DEFAULT_TURN_STEP_CAP, TurnStepTracker } from "../../turn-continuation.ts";
 import {
   classifyQuiet, describeQuiet, formatQuietLimit, quietNoticeText, lastSeenPhrase, LIMIT_WORDS, LogTail, promptIdleTimeoutMs, quietKey, quietNoticeMs, quietTickMs, quietVerdict, sampleProcessTree,
   type LogSignal, type ProcessSample, type QuietState,
@@ -817,10 +818,25 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           const finished = u.status === "completed" || u.status === "failed";
           const toolEnded = (itemId: string | undefined) => {
             current.state.producedItem = true;
-            for (const event of acpToolEndEvents(u, itemId, current.endedToolIds)) emit({ ...base(threadId, current.turnId), ...event });
+            let endedNow = false;
+            for (const event of acpToolEndEvents(u, itemId, current.endedToolIds)) {
+              if (event.itemType === "tool") {
+                endedNow = true;
+                current.stepTracker.recordToolEnd({ id: itemId, ok: event.ok, output: event.output });
+              }
+              emit({ ...base(threadId, current.turnId), ...event });
+            }
+            if (endedNow) {
+              current.stepTracker.completeStep();
+              if (current.stepTracker.exhausted && current.stepTracker.pendingTools === 0) current.stopAtStepCap();
+            }
           };
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
+              if (current.stepTracker.exhausted) {
+                current.stopAtStepCap();
+                break;
+              }
               const content = u.content;
               const delta = content?.text;
               if (content?.type === "image" && typeof content.data === "string" && content.data) {
@@ -854,20 +870,27 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call": {
+              if (current.stepTracker.exhausted) {
+                current.stopAtStepCap();
+                break;
+              }
               current.flushAssistantText();
               trackRunningTool(current, u, "pending");
               // ACP can send a tool_call already marked completed or failed (e.g. on a denied permission) with no
               // tool_call_update after it.
               const itemId = (typeof u.toolCallId === "string" && u.toolCallId) ? u.toolCallId
                 : finished ? `acp-tool-unkeyed-${++unkeyedToolSeq}` : nextUnkeyedToolId(current);
+              const title = String(u.rawInput?.command ?? u.title ?? "tool").slice(0, 80);
+              const input = toolDetailPreview(u.rawInput);
+              current.stepTracker.recordToolStart({ id: itemId, name: title, input });
               emit({
                 ...base(threadId, current.turnId),
                 type: "item.started",
                 itemType: "tool",
                 itemId,
-                title: String(u.rawInput?.command ?? u.title ?? "tool").slice(0, 80),
+                title,
                 summary: commandSummary(u.rawInput),
-                input: toolDetailPreview(u.rawInput),
+                input,
               });
               if (finished) toolEnded(itemId);
               break;
@@ -1099,14 +1122,35 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const receiveModelVariants = (result: any, replace = false) => modelControls.receive(result, replace);
         const requestedVariantOption = () => modelControls.variant(variant);
 
+        const stepTracker = new TurnStepTracker(DEFAULT_TURN_STEP_CAP);
         const flushAssistantText = () => {
           const raw = state.text;
           state.text = "";
           const text = stripLeakedSystemHarnessMessages(raw);
           if (!text.trim()) return;
+          stepTracker.recordAssistantText(text);
           state.producedItem = true;
           state.repliedText = true;
           emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
+        };
+        const stopAtStepCap = () => {
+          if (state.settled || state.stopped) return;
+          state.stopped = true;
+          flushAssistantText();
+          const { failure, handoffPath } = stepTracker.writeCheckpoint({
+            threadId,
+            turnId,
+            model: reportedModel,
+            sessionId: session.sessionId,
+            task: cliTurn.text,
+          });
+          emit({ ...base(threadId, turnId), type: "runtime.error", message: failure, terminal: true });
+          if (handoffPath) emit({ ...base(threadId, turnId), type: "cap.exhausted", handoffPath, reason: "cap" });
+          if (session.sessionId) {
+            try { session.acp.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: session.sessionId } }); } catch {}
+          }
+          settle(threadId, session, false, "step_cap");
+          closeSession(threadId, "step_cap");
         };
         const current: AcpTurn = {
           turnId,
@@ -1122,6 +1166,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           interruptTimer: null,
           stopQuietWatch: null,
           flushAssistantText,
+          stepTracker,
+          stopAtStepCap,
           receiveModelVariants,
           steering: support.steer && acpTurnSteering(support.steer,
             () => state.promptSent && !state.settled && !state.stopped && !session.closing && session.commands?.has(support.steer!.command) === true,

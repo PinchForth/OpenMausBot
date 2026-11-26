@@ -23,6 +23,7 @@ import { claudeElicitations } from "./claude-elicitation.ts"; import { spawnCont
 import { readCostHistory, recordCostState } from "./claude-cost-history.ts";
 import { classifyResumeFailure, mayReplay, rebuiltSessionNotice, recoveryPromptFor } from "../resume-recovery.ts";
 import { ClaudeLoginController } from "./claude-login-auth.ts";
+import { DEFAULT_TURN_STEP_CAP, TurnStepTracker } from "../turn-continuation.ts";
 
 import type {
   DriverCreateInput,
@@ -872,6 +873,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         continuationGrace: ReturnType<typeof setTimeout> | null;
         armGrace?: () => void;
         continuationSilence: ReturnType<typeof setTimeout> | null;
+        stepTracker: TurnStepTracker;
       } | null;
       idleTimer: ReturnType<typeof setTimeout> | null;
       closing: boolean;
@@ -1205,7 +1207,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const live = sessions.get(threadId);
       if (!turn.sessionReset && live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, input: turn, retryAbort, settled: false, sawStreamDelta: false, awaitingInit: true, pendingSteers: new Set(), deferred: null, continuationGrace: null, continuationSilence: null };
+        live.turn = { turnId, input: turn, retryAbort, settled: false, sawStreamDelta: false, awaitingInit: true, pendingSteers: new Set(), deferred: null, continuationGrace: null, continuationSilence: null, stepTracker: new TurnStepTracker(DEFAULT_TURN_STEP_CAP) };
         active.set(threadId, { stop: () => {
           if (live.turn) live.turn.stopRequested = true;
           closeSession(threadId, "interrupted");
@@ -1367,7 +1369,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         sawInit: false,
         nativePermissionMode: null,
         replaysUserMessages,
-        turn: { turnId, input: turn, retryAbort, settled: false, sawStreamDelta: false, pendingSteers: new Set(), deferred: null, continuationGrace: null, continuationSilence: null },
+        turn: { turnId, input: turn, retryAbort, settled: false, sawStreamDelta: false, pendingSteers: new Set(), deferred: null, continuationGrace: null, continuationSilence: null, stepTracker: new TurnStepTracker(DEFAULT_TURN_STEP_CAP) },
         idleTimer: null,
         closing: false,
         stderr: "",
@@ -1407,7 +1409,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         session.turn = null;
         retryState.delete(threadId);
         // `claude update` cannot change code this child already loaded, and a signed-out child can keep holding the shared OAuth refresh lock: retire both before completing.
-        if (stopReason === "update_required" || stopReason === "auth_required") closeSession(threadId, stopReason === "auth_required" ? "authentication required" : "update required");
+        if (stopReason === "update_required" || stopReason === "auth_required" || stopReason === "step_cap") closeSession(threadId, stopReason === "auth_required" ? "authentication required" : stopReason === "step_cap" ? "step_cap" : "update required");
         else if (session.teamToolsFailed) closeSession(threadId, "team tools did not connect");
         const cost = turnCostFromRunningTotal(total, session.costTotal ?? null);
         if (total !== null) session.costTotal = total;
@@ -1416,6 +1418,22 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       };
       const settleResult = (result: NativeTurnResult) => settle(result.ok, result.stopReason, result.cost, result.usage);
       const currentTurnId = () => session.turn?.turnId ?? turnId;
+      const stopAtStepCap = () => {
+        const t = session.turn;
+        if (!t || t.settled) return;
+        t.explained = true;
+        const { failure, handoffPath } = t.stepTracker.writeCheckpoint({
+          threadId,
+          turnId: t.turnId,
+          model: t.input.model,
+          sessionId: session.sessionId,
+          task: t.input.text,
+        });
+        emit({ ...base(threadId, t.turnId), type: "runtime.error", message: failure, terminal: true });
+        if (handoffPath) emit({ ...base(threadId, t.turnId), type: "cap.exhausted", handoffPath, reason: "cap" });
+        settle(false, "step_cap", null);
+        stopSession(session);
+      };
       const reachLimit = (frame: { api_error_params?: { rate_limit_info?: unknown } }, words: unknown) => {
         const t = session.turn;
         if (!t || t.limitReached) return;
@@ -1512,6 +1530,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             break;
           }
           case "assistant": {
+            if (!o.parent_tool_use_id && session.turn?.stepTracker.exhausted) {
+              stopAtStepCap();
+              break;
+            }
             const msg = o.message ?? {};
             const text = firstText(msg.content);
             const swap = modelSwapNotice(session, threadId, session.turn?.input.model, o, models);
@@ -1538,13 +1560,19 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             if (session.turn) session.turn.answered = true;
             if (text.trim()) {
+              if (!o.parent_tool_use_id) session.turn?.stepTracker.recordAssistantText(text);
               // fallback delta for CLIs/paths that never streamed the block
               if (!session.turn?.sawStreamDelta) emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
               if (session.turn) session.turn.sawStreamDelta = false;
               emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
             }
+            let sawTopTool = false;
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {
+                if (!o.parent_tool_use_id) {
+                  sawTopTool = true;
+                  session.turn?.stepTracker.recordToolStart({ id: b.id, name: b.name, input: b.input });
+                }
                 emit({
                   ...base(threadId, currentTurnId()),
                   type: "item.started",
@@ -1556,6 +1584,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                 });
               }
             }
+            if (sawTopTool && session.turn) session.turn.stepTracker.completeStep();
             if (msg.usage) {
               emit({
                 ...base(threadId, currentTurnId()), ...(typeof msg.id === "string" ? { itemId: msg.id } : {}),
@@ -1579,12 +1608,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             for (const b of Array.isArray(o.message?.content) ? o.message.content : []) {
               if (b.type === "tool_result") {
-                emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "tool", itemId: b.tool_use_id, ok: !b.is_error, output: toolDetailPreview(b.content) });
+                const output = toolDetailPreview(b.content);
+                if (!o.parent_tool_use_id) session.turn?.stepTracker.recordToolEnd({ id: b.tool_use_id, ok: !b.is_error, output });
+                emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "tool", itemId: b.tool_use_id, ok: !b.is_error, output });
                 for (const img of extractMcpImages(b.content)) {
                   emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_image", data: img.data, fromTool: true });
                 }
               }
             }
+            if (!o.parent_tool_use_id && session.turn?.stepTracker.exhausted && session.turn.stepTracker.pendingTools === 0) stopAtStepCap();
             break;
           }
           case "rate_limit_event":

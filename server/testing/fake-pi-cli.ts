@@ -158,6 +158,34 @@ const streamErrorTurn = () => {
   send({ type: "agent_end" });
 };
 
+const streamStepLoopTurn = () => {
+  const run = ++scriptRun;
+  const totalSteps = Math.max(1, Number(process.env.FAKE_PI_STEP_COUNT ?? 160));
+  const finishAfter = process.env.FAKE_PI_FINISH_AFTER_STEP_LOOP === "1";
+  let step = 0;
+  send({ type: "agent_start" });
+  const tick = () => {
+    if (run !== scriptRun) return;
+    if (step >= totalSteps) {
+      if (finishAfter) {
+        send({ type: "turn_start" });
+        send({ type: "message_update", usage: { input: 10, output: 2 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: `completed ${step} steps` } });
+        send({ type: "turn_end", message: { stopReason: "end_turn", usage: { input: 10, output: 2 } }, usage: { input: 10, output: 2 } });
+        send({ type: "agent_end" });
+      }
+      return;
+    }
+    step += 1;
+    const id = `loop_call_${step}`;
+    send({ type: "turn_start" });
+    send({ type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: `echo step-${step}` } });
+    send({ type: "tool_execution_end", toolCallId: id, toolName: "bash", isError: false, result: { content: [{ type: "text", text: `step-${step}-ok` }] } });
+    send({ type: "turn_end", message: { stopReason: "toolUse", usage: { input: 2, output: 1 } }, usage: { input: 2, output: 1 } });
+    setTimeout(tick, 2);
+  };
+  tick();
+};
+
 const streamCompactionTurn = () => {
   send({ type: "agent_start" });
   send({ type: "turn_start" });
@@ -421,6 +449,7 @@ function handle(cmd: any) {
       else if (mode === "compaction") streamCompactionTurn();
       else if (mode === "compaction-recovery") streamCompactionRecoveryTurn();
       else if (mode === "compaction-recovery-upstream") streamCompactionRecoveryUpstreamTurn();
+      else if (mode === "step-loop") streamStepLoopTurn();
       else if (mode === "omp-chunk") streamChunkedTurn();
       else streamTurn();
       return;

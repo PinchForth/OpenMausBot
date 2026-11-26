@@ -866,6 +866,16 @@ const playTurn = (prompt: JsonValue, late = false) => {
   steeredMessages = [];
   // FAKE_CLAUDE_PROMPTS: every prompt this process receives, one JSON line each.
   if (process.env.FAKE_CLAUDE_PROMPTS) appendFileSync(process.env.FAKE_CLAUDE_PROMPTS, `${JSON.stringify(prompt)}\n`);
+  if (process.env.FAKE_CLAUDE_LAUNCH_LOG) {
+    appendFileSync(process.env.FAKE_CLAUDE_LAUNCH_LOG, JSON.stringify({
+      pid: process.pid,
+      sessionId,
+      resumed: argv.includes("--resume"),
+      hasSessionIdFlag: argv.includes("--session-id"),
+      prompt: promptText(prompt),
+      argv,
+    }) + "\n");
+  }
   volatileNote = volatileNoteIn(prompt) ?? volatileNote;
   const homeFiles = process.env.FAKE_CLAUDE_HOME_FILES === "1";
   const signedInAs = homeFiles ? homeSignIn() : undefined;
@@ -1130,6 +1140,39 @@ const playTurn = (prompt: JsonValue, late = false) => {
     turnRunning = false;
     finishIfDone();
   };
+
+  if (mode === "step-cap-recovery") {
+    const text = promptText(prompt);
+    const checkpointMatch = /Every step so far is listed in ([^\s;]+\.md)/.exec(text);
+    if (checkpointMatch) {
+      const checkpointPath = checkpointMatch[1]!;
+      const checkpointExists = existsSync(checkpointPath);
+      const checkpointText = checkpointExists ? readFileSync(checkpointPath, "utf8") : "";
+      const verifyId = `tu-${process.pid}-${++toolUseCount}`;
+      out({ type: "assistant", message: { content: [{ type: "tool_use", id: verifyId, name: "Read", input: { file_path: checkpointPath } }], usage } });
+      out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: verifyId, is_error: !checkpointExists, content: checkpointExists ? "checkpoint loaded" : "missing checkpoint" }] } });
+      out({ type: "assistant", message: { content: [{ type: "text", text: `Resumed in fresh session ${sessionId} from ${checkpointPath} (steps150=${checkpointText.includes("Steps used: 150")}); remaining work completed.` }], usage } });
+      finish();
+      return;
+    }
+    const targetSteps = Math.max(1, Number(process.env.FAKE_CLAUDE_STEP_COUNT ?? 160));
+    let step = 0;
+    const stepNext = () => {
+      if (!turnRunning || stdinEnded) return;
+      if (step >= targetSteps) {
+        out({ type: "assistant", message: { content: [{ type: "text", text: `Finished ${step} steps without hitting cap.` }], usage } });
+        finish();
+        return;
+      }
+      step += 1;
+      const id = `tu-${process.pid}-step-${step}`;
+      out({ type: "assistant", message: { content: [{ type: "tool_use", id, name: "Bash", input: { command: `echo work-${step}` } }], usage } });
+      out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: false, content: `ok-${step}` }] } });
+      setTimeout(stepNext, 2);
+    };
+    stepNext();
+    return;
+  }
 
   const script = streamScript(promptText(prompt));
   if (script) {

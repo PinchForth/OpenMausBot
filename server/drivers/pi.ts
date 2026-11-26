@@ -51,6 +51,7 @@ import { buildMcpServers } from "./pi-mcp-servers.ts";
 import { noticeFailure } from "../chat-notices.ts";
 
 import { decodePiFrame, PiRpcChunks, piLineReader, readPiPromptImages } from "./pi-rpc.ts";
+import { DEFAULT_TURN_STEP_CAP, TurnStepTracker } from "../turn-continuation.ts";
 import { PiRunUsage, type PiUsage, type TurnUsage } from "./pi-usage.ts";
 export { decodePiFrame, PiRpcChunks, piLineReader } from "./pi-rpc.ts";
 
@@ -451,6 +452,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       let completion: Promise<void> | null = null;
       let endStopReason: string | undefined;
       const runUsage = new PiRunUsage();
+      const stepTracker = new TurnStepTracker(DEFAULT_TURN_STEP_CAP);
       let completionOutcome: { ok: boolean; stopReason: string; cost?: number; usage?: TurnUsage } | null = null;
       let endErrorMessage: string | undefined;
       let agentEndTimer: ReturnType<typeof setTimeout> | null = null;
@@ -587,6 +589,26 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         settle(true, sr === "cancelled" || sr === "aborted" ? "cancelled" : "end_turn", runUsage.usage);
       };
 
+      const stopAtStepCap = () => {
+        if (settled) return;
+        flushAssistantText();
+        const { failure, handoffPath } = stepTracker.writeCheckpoint({
+          threadId,
+          turnId,
+          model: confirmedModel ?? (typeof turn.model === "string" ? turn.model : undefined),
+          usage: runUsage.usage,
+          hasUsage: Boolean(runUsage.usage),
+          sessionId: sessionId ?? sessionFile,
+          task: turn.text,
+        });
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: failure, terminal: true });
+        if (handoffPath) emit({ ...base(threadId, turnId), type: "cap.exhausted", handoffPath, reason: "cap" });
+        try {
+          send({ type: "abort" });
+        } catch {}
+        void settle(false, "step_cap", runUsage.usage);
+      };
+
       const stop = () => {
         try {
           send({ type: "abort" });
@@ -635,6 +657,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             if (!e) return;
             if (e.type === "text_delta" && typeof e.delta === "string") {
               assistantText += e.delta;
+              stepTracker.appendAssistantDelta(e.delta);
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: e.delta });
             } else if (e.type === "thinking_delta" && typeof e.delta === "string") {
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta: e.delta });
@@ -642,7 +665,12 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             return;
           }
           case "tool_execution_start": {
+            if (stepTracker.exhausted) {
+              stopAtStepCap();
+              return;
+            }
             flushAssistantText();
+            stepTracker.recordToolStart({ id: evt.toolCallId, name: evt.toolName, input: evt.args });
             emit({
               ...base(threadId, turnId),
               type: "item.started",
@@ -655,13 +683,15 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             return;
           }
           case "tool_execution_end": {
+            const output = toolDetailPreview(evt.result);
+            stepTracker.recordToolEnd({ id: evt.toolCallId, name: evt.toolName, ok: !evt.isError, output });
             emit({
               ...base(threadId, turnId),
               type: "item.completed",
               itemType: "tool",
               itemId: evt.toolCallId,
               ok: !evt.isError,
-              output: toolDetailPreview(evt.result),
+              output,
             });
             return;
           }
@@ -749,7 +779,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             const sr = evt.message?.stopReason;
             runUsage.endTurn(evt.usage ?? evt.message?.usage);
             // toolUse: pi ran a tool and auto-continues; the next turn_end carries the outcome.
-            if (sr === "toolUse" || sr === "tool_use" || sr === "tool_calls") return;
+            if (sr === "toolUse" || sr === "tool_use" || sr === "tool_calls") {
+              stepTracker.completeStep();
+              return;
+            }
             endStopReason = sr;
             endErrorMessage = evt.message?.errorMessage;
             // pi can schedule maintenance (overflow-recovery compaction) after the final turn_end;
@@ -758,7 +791,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             agentEndTimer.unref?.();
             return;
           }
-          case "turn_start":
+          case "turn_start": {
+            if (agentEndTimer) clearTimeout(agentEndTimer);
+            agentEndTimer = null;
+            return;
+          }
           case "agent_start": {
             if (agentEndTimer) clearTimeout(agentEndTimer);
             agentEndTimer = null;

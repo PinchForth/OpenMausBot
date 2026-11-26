@@ -3825,7 +3825,7 @@ function runRoomNode(node: HandoffView, group: GroupRecord, bot: BotRecord, sign
     });
     groupQueues.set(node.threadId, tracked.catch(() => {}));
     tracked.then(
-      () => finish({ ok: result.outcome === "settled", text: result.stopReason || result.replyText || result.outcome || "The addressed agent could not run", ...(result.approvalAsk ? { approvalAsk: result.approvalAsk } : {}) }),
+      () => finish({ ok: result.outcome === "settled", text: result.stopReason || result.replyText || result.outcome || "The addressed agent could not run", ...(result.approvalAsk ? { approvalAsk: result.approvalAsk } : {}), ...(result.cap ? { cap: result.cap } : {}) }),
       error => finish({ ok: false, text: error instanceof Error ? error.message : String(error) }),
     );
   });
@@ -3842,7 +3842,7 @@ function runRoomRootTurn(node: HandoffView, group: GroupRecord, bot: BotRecord, 
   return runRoomNode(node, group, bot, signal, undefined, (operation, result, coordination) =>
     runGroupMemberTurn(group.id, node.threadId, bot.id, 0, new Set(), composed.text, error => { result.stopReason = error; }, () => operation.cancelled,
       () => groupProviderHandshakeStarted(operation), () => groupProviderHandshakeSettled(operation), undefined,
-      { roomHandoffId: node.id, systemInstructions: "", followMentions: true, result, coordination, ...(node.goalRunId ? { goalRunId: node.goalRunId } : {}) }, operation), composed.turn !== "first");
+      { roomHandoffId: node.id, systemInstructions: "", followMentions: true, result, coordination, ...(composed.turn === "continued" ? { freshSession: true } : {}), ...(node.goalRunId ? { goalRunId: node.goalRunId } : {}) }, operation), composed.turn !== "first");
 }
 
 function runRootTurn(node: HandoffView, bot: BotRecord, signal: AbortSignal, composed: ComposedTurn): Promise<HostTurnResult> {
@@ -3867,6 +3867,7 @@ function runRootTurn(node: HandoffView, bot: BotRecord, signal: AbortSignal, com
     if (signal.aborted) { abort(); return; }
     void startTurn(bot.id, composed.text, {
       threadId: node.threadId, cardContinuation: true, continuesRun: composed.turn !== "first",
+      ...(composed.turn === "continued" ? { freshSession: true } : {}),
       ...(ownRequest?.messageId ? { requestMessageId: ownRequest.messageId } : {}),
       ...(ownRequest ? {} : { origin: actingPeople.handedOrigin(node.origin ?? OUTSIDE, node.id) }),
       unattended: isUnattended(bot.id, node.threadId),
@@ -4052,6 +4053,7 @@ const botLink = createBotLinkHost({ roomLine: (threadId, key, params) => serverL
         const swapped = parent && ownThreads.own(parent, node) ? ownThreads.swapRefusal(bot, node.threadId) : null; if (swapped) { finish({ ok: false, text: swapped }); return; }
         void startTurn(bot.id, turnText, {
           threadId: node.threadId, cardContinuation: true, commsDepth: MAX_COMMS_DEPTH, continuesRun: composed.turn !== "first",
+          ...(composed.turn === "continued" ? { freshSession: true } : {}),
           requestMessageId: directRequestOwners.get(node.threadId)?.generations.has(node.rootId)
             ? directRequestOwners.get(node.threadId)?.messageId : undefined,
           origin: actingPeople.handedOrigin(coordinator.node(node.rootId)?.origin ?? OUTSIDE, node.id),
@@ -4064,7 +4066,7 @@ const botLink = createBotLinkHost({ roomLine: (threadId, key, params) => serverL
         runGroupMemberTurn(group.id, node.threadId, bot.id, MAX_COMMS_DEPTH, new Set(),
           undefined, error => { result.stopReason = error; }, () => operation.cancelled,
           () => groupProviderHandshakeStarted(operation), () => groupProviderHandshakeSettled(operation),
-          { claimed: true }, { roomHandoffId: node.id, resumed, systemInstructions, turnInstructions: brief, turnNote: composed.note, turnRestartNote: composed.restartNote, liveRoster, followMentions: false, result, coordination }, operation), composed.turn !== "first");
+          { claimed: true }, { roomHandoffId: node.id, resumed, systemInstructions, turnInstructions: brief, turnNote: composed.note, turnRestartNote: composed.restartNote, liveRoster, followMentions: false, result, coordination, ...(composed.turn === "continued" ? { freshSession: true } : {}) }, operation), composed.turn !== "first");
     }),
     names: (node, parent) => {
       const scope = parent ?? node;
@@ -5070,6 +5072,14 @@ watchdog.start(); const idleThreads = createIdleThreads({ store, claims: directT
 bus.subscribe((event: RuntimeEvent) => {
   if (shouldIgnoreProviderEvent(event)) return;
   turnStops.note(event);
+  if (event.type === "cap.exhausted") {
+    const capBot = store.botByThread(event.threadId);
+    if (capBot) store.patchTask(capBot.id, event.threadId, { resumeCursors: {} });
+    else {
+      const speakerBotId = groupSpeakers.get(event.threadId)?.botId;
+      if (speakerBotId) roomSessions.distrust(event.threadId, speakerBotId);
+    }
+  }
   if (event.type === "request.opened") watchdog.setWaitingOnHuman(event.threadId, true);
   else if (event.type === "request.resolved") watchdog.setWaitingOnHuman(event.threadId, false);
   else if (event.type === "turn.wait_started") watchdog.setWaitingOnComputer(event.threadId, true);
@@ -7551,6 +7561,7 @@ async function beginTurn(
     goalRunId?: string;
     coordination?: { id: string; resumed: boolean; settle: (outcome: HostTurnResult) => void };
     /** Carries on a run already started (a hand-off's result, an answered card, a restart): usage caps never refuse it (usage-caps.ts). */ continuesRun?: boolean;
+    /** Starts a fresh provider session without replaying pre-cap history (used when continuing after a 150-step cap checkpoint). */ freshSession?: boolean;
     /** A person's own send: it may run beside a room turn on another thread. */ allowRoomTurnElsewhere?: boolean;
   },
 ) {
@@ -7853,7 +7864,35 @@ async function beginTurn(
       const replay = usesNativeImageInput
         ? extractReplayImages(selection.inline, turnImages)
         : { transcript: selection.inline, images: [] };
+      if (opts?.freshSession) store.patchTask(bot.id, threadId, { resumeCursors: {} });
       const decideContext = (config: string) => {
+        if (opts?.freshSession) {
+          const carried = [...skipTranscript];
+          const { turnText: contextTurnText } = buildTurnContext({
+            text: userTurnText,
+            transcript: replay.transcript,
+            rewound: false,
+            fresh: true,
+            externallyUpdated: false,
+            replaysNatively: replaysNatively(instance.driverKind),
+          });
+          const windowIds = selection.representedIds;
+          return {
+            turnText: contextTurnText,
+            images: contextTurnText !== userTurnText ? [...replay.images, ...turnImages] : turnImages,
+            resumeCursor: undefined,
+            sessionReset: true,
+            recoveryText: undefined,
+            handoff: strictResume ? {
+              botId: bot.id, instanceId, config, resumeCursor: undefined,
+              ...(instance.driverKind === "codex" ? { effort: effort ?? null } : {}),
+              started: sessionStart(contextOrder, contextTurnText !== userTurnText ? windowIds : [], carried),
+              recovery: sessionStart(contextOrder, contextTurnText !== userTurnText ? windowIds : [], carried),
+              resumed: sessionStart(contextOrder, contextTurnText !== userTurnText ? windowIds : [], carried),
+              placed: [], carried, own: [userMessage.id, ...(opts?.excludeMessageIds ?? [])],
+            } : undefined,
+          };
+        }
         // A Codex thread keeps the last effort it was sent and no turn can clear it, so one holding a level is rebuilt, not resumed.
         const effortHeld = !effort && typeof handed?.effort === "string";
         const handedStale = Boolean(handed && (!unseen || effortHeld || (externalUpdate && handed.config !== config)));
@@ -9545,7 +9584,8 @@ type GroupTurnOrchestration = {
   turnNote?: string;
   turnRestartNote?: string;
   followMentions: boolean;
-  result: { replyText?: string; outcome?: GroupMemberTurnOutcome; stopReason?: string | null; approvalAsk?: string };
+  freshSession?: boolean;
+  result: { replyText?: string; outcome?: GroupMemberTurnOutcome; stopReason?: string | null; approvalAsk?: string; cap?: { note: string; handoffPath?: string } };
   onClaimed?: () => void;
   onTurnStarted?: (turnId: string) => void;
   coordination?: { id: string; settle: (outcome: HostTurnResult) => void };
@@ -10254,6 +10294,10 @@ async function runClaimedGroupMemberTurn(
       else if (e.type === "turn.completed") {
         turnCompletedOk = e.ok;
         const end = roomTurnEnd(e, Boolean(orchestration), roomClaimFailure);
+        if (orchestration && !e.ok) {
+          const capStop = turnStops.read(threadId, e.turnId);
+          if (capStop?.handoffPath) orchestration.result.cap = { note: STEP_CAP_NOTE, handoffPath: capStop.handoffPath };
+        }
         if (orchestration && end.stopReason !== undefined) {
           orchestration.result.stopReason = roomClaimFailure ? end.stopReason : stoppedTurnText(threadId, e.turnId, undefined, end.stopReason);
         }
@@ -10294,7 +10338,7 @@ async function runClaimedGroupMemberTurn(
     const clock = turnClockLine(Date.now(), hostTimeZone()), roomPick = cardContinuation ? "" : takeRoomPick(operation, readyBot.id);
     const roomToolScope = toolScopeForTurn(readyBot.id), roomUserMcp = claudeUserMcpEnabled(cfg) && !managedPolicy.restrictsMcp();
     const roomSession = roomSessions.dispatch({
-      threadId, botId: readyBot.id, claimId: internalGeneration, instance, guestConfined: roomGuestConfined, reset: Boolean(roomReset), hooks: Boolean(integrations.hooks),
+      threadId, botId: readyBot.id, claimId: internalGeneration, instance, guestConfined: roomGuestConfined, reset: Boolean(roomReset || orchestration?.freshSession), hooks: Boolean(integrations.hooks),
       context: () => ({ ...roomMemberContexts.forThread(threadId)?.[readyBot.id], compactAt: nativeCompactTokens(instance) }),
       config: [roomSystem.stable, cwd, readyBot.modelSelection, turnApprovalMode, roomToolScope, roomUserMcp, integrations],
       window: roomWindow, tail: roomTail, wrap: (body) => withTurnClock(clock, withRecalled(roomRecalled, roomPick + attachmentsForBox(body, cwd) + roomShareNote.text + devsReports.note(threadId, Boolean(integrations.agents)))),
