@@ -276,4 +276,91 @@ describe("trace recorder", () => {
     const spans = (await readSpans(dir, daysBetween(T0, T0 + 30_000), new Set(["busy:t1"]))).get("busy:t1")!;
     expect(spans.filter((span) => span.kind === "tool")).toHaveLength(2_000);
   });
+
+  it("records tool name and first sanitized error line for multi-line JSON, truncated JSON, and object errors in spans and settled fields", async () => {
+    const dir = dataDir();
+    const recorder = createTraceRecorder({ dataDir: dir, now: () => T0 + 10_000 });
+    recorder.observe(started("bot", "turn-err", 0));
+    recorder.observe(tool("bot", "turn-err", 10, "c1", "bash", { command: "curl https://api.example.test" }));
+    recorder.observe(done("bot", "turn-err", 20, "c1", false, JSON.stringify({
+      ok: false,
+      output: "curl: (22) 401 Unauthorized Bearer sk-ant-secret12345678901234567890\nsecond line ignored",
+      exitCode: 22,
+    }, null, 2)));
+    recorder.observe(tool("bot", "turn-err", 30, "c2", "read", { path: "missing.txt" }));
+    recorder.observe(done("bot", "turn-err", 40, "c2", false, "{\n  \"ok\": false,\n  \"output\": \"ENOENT: password=topsecretvalue123\\nstack trace\"\n[… preview shortened]"));
+    recorder.receipt("bot", {
+      name: "mcp__agents__run",
+      startedAt: T0 + 50,
+      endedAt: T0 + 60,
+      ok: false,
+      error: "Remote auth failed with token=mysecrettokenvalue123\nmore detail",
+    });
+    recorder.observe(completed("bot", "turn-err", 100));
+    const settled = recorder.settle("bot");
+    expect(settled).toMatchObject({
+      toolErrors: 3,
+      failedSteps: [
+        { tool: "bash", error: expect.stringContaining("curl: (22) 401 Unauthorized Bearer «redacted") },
+        { tool: "read", error: expect.stringContaining("ENOENT: password=«redacted") },
+        { tool: "mcp__agents__run", error: expect.stringContaining("Remote auth failed with token=«redacted") },
+      ],
+    });
+    for (const entry of (settled as { failedSteps: Array<{ tool: string; error?: string }> }).failedSteps) {
+      expect(entry.error).not.toContain("sk-ant-secret");
+      expect(entry.error).not.toContain("topsecretvalue123");
+      expect(entry.error).not.toContain("mysecrettokenvalue123");
+      expect(entry.error).not.toContain("\n");
+      expect(entry.error).not.toBe("{");
+    }
+    await flushSpans(dir);
+    const spans = (await readSpans(dir, daysBetween(T0, T0 + 1_000), new Set(["bot:turn-err"]))).get("bot:turn-err")!;
+    const toolSpans = spans.filter((s) => s.kind === "tool");
+    expect(toolSpans.map((s) => ({ name: s.name, error: s.error }))).toEqual([
+      { name: "bash", error: expect.stringContaining("curl: (22) 401 Unauthorized Bearer «redacted") },
+      { name: "read", error: expect.stringContaining("ENOENT: password=«redacted") },
+      { name: "mcp__agents__run", error: expect.stringContaining("Remote auth failed with token=«redacted") },
+    ]);
+  });
+
+  it("extracts object JSON-RPC errors via timeServed with redaction", async () => {
+    const dir = dataDir();
+    const recorder = createTraceRecorder({ dataDir: dir, now: () => T0 + 5_000 });
+    recorder.observe(started("bot", "t-rpc", 0));
+    let finish!: () => void;
+    const answer = new Promise<void>((resolve) => { finish = resolve; });
+    const server = createServer(async (req, res) => {
+      await readBody(req);
+      recorder.timeServed(req, res, "bot");
+      await answer;
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: 1,
+        error: { code: -32603, message: "Upstream rejected Authorization: Basic dXNlcjpwYXNzd29yZA==\nretry later" },
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const { port } = server.address() as { port: number };
+    const response = fetch(`http://127.0.0.1:${port}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "browser_open", arguments: { url: "https://example.com" } } }),
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finish();
+      await (await response).text();
+      recorder.observe(completed("bot", "t-rpc", 100));
+      const settled = recorder.settle("bot") as { failedSteps?: Array<{ tool: string; error?: string }> };
+      expect(settled.failedSteps).toHaveLength(1);
+      expect(settled.failedSteps![0]!.tool).toBe("browser_open");
+      expect(settled.failedSteps![0]!.error).toContain("Upstream rejected Authorization: Basic «redacted");
+      expect(settled.failedSteps![0]!.error).not.toContain("dXNlcjpwYXNzd29yZA==");
+      expect(settled.failedSteps![0]!.error).not.toContain("retry later");
+    } finally {
+      finish();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });

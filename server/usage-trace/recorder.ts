@@ -3,7 +3,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { RuntimeEvent } from "../../shared/runtime-events.ts";
 import { TOOL_NAMESPACE } from "../../shared/tool-surface.ts";
-import type { TraceParent, TraceStatus, TraceTokens, TraceUsageStatus } from "../../shared/usage-trace.ts";
+import type { FailedStepRecord, TraceParent, TraceStatus, TraceTokens, TraceUsageStatus } from "../../shared/usage-trace.ts";
 import { onJsonBody, parsedBodyOf } from "../harness/http.ts";
 import { errorLine, pageTitle, toolDetail } from "./detail.ts";
 import { appendSpans, type SpanRecord, type StepSpan, type ToolSpan } from "./spans.ts";
@@ -18,6 +18,7 @@ export interface TurnTraceFields {
   steps: number;
   tools: number;
   toolErrors: number;
+  failedSteps?: FailedStepRecord[];
   cacheWrite?: number;
   reasoning?: number;
   contextTokens?: number;
@@ -89,6 +90,7 @@ const PER_CALL = new Set(["claude"]);
 const THREAD_TOTALS = new Set(["codex"]);
 const TURN_TOTALS = new Set(["grok", "groq", "greenference", "modelgo", "cerebras", "mistral", "minimax", "meta", "openai-compat"]);
 const MAX_LINKS = 5_000;
+const MAX_FAILED_STEPS = 50;
 const ENDED_GRACE_MS = 120_000;
 const RECEIPT_SLACK_MS = 3_000;
 const STOPPED = /interrupt|cancel|abort|stopp?ed|user_stop/i;
@@ -363,7 +365,8 @@ export function createTraceRecorder(options: { dataDir: string; now?: () => numb
     if (served.detail) span.detail = served.detail;
     if (!served.ok) {
       span.status = "error";
-      if (served.error) span.error = served.error;
+      const err = errorLine(served.error);
+      if (err) span.error = err;
     }
     if (turn.flushed) flush(turn, [span], false);
   }
@@ -381,6 +384,13 @@ export function createTraceRecorder(options: { dataDir: string; now?: () => numb
     };
     const cacheWrite = PER_CALL.has(turn.provider) ? sum((step) => step.tokens?.cacheWrite) : undefined;
     const reasoning = sum((step) => step.tokens?.reasoning);
+    const failedSteps: FailedStepRecord[] = [];
+    for (const tool of tools) {
+      if (tool.status !== "error") continue;
+      const error = tool.error !== undefined ? errorLine(tool.error) : undefined;
+      failedSteps.push({ tool: tool.name, ...(error ? { error } : {}) });
+      if (failedSteps.length >= MAX_FAILED_STEPS) break;
+    }
     return {
       turnId: turn.turnId,
       startedAt: new Date(turn.startedAt).toISOString(),
@@ -390,6 +400,7 @@ export function createTraceRecorder(options: { dataDir: string; now?: () => numb
       steps: turn.steps.length,
       tools: tools.length,
       toolErrors: tools.filter((tool) => tool.status === "error").length,
+      ...(failedSteps.length ? { failedSteps } : {}),
       ...(cacheWrite ? { cacheWrite } : {}),
       ...(reasoning ? { reasoning } : {}),
       ...(turn.contextTokens !== undefined ? { contextTokens: turn.contextTokens } : {}),
@@ -411,7 +422,7 @@ export function createTraceRecorder(options: { dataDir: string; now?: () => numb
       const answer = (body ?? {}) as { error?: unknown; result?: { isError?: unknown; content?: Array<{ text?: unknown }> } };
       const failed = answer.error !== undefined || answer.result?.isError === true;
       const detail = toolDetail(name, request?.params?.arguments);
-      const error = failed ? errorLine(typeof answer.error === "string" ? answer.error : answer.result?.content?.find((part) => typeof part.text === "string")?.text) : undefined;
+      const error = failed ? errorLine(answer.error ?? answer.result?.content ?? answer.result) : undefined;
       receiptFor(turn, { name, startedAt, endedAt: now(), ok: !failed, ...(detail ? { detail } : {}), ...(error ? { error } : {}) });
       return body;
     });

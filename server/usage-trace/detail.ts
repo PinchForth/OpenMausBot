@@ -69,8 +69,87 @@ export function pageTitle(output: unknown): string | undefined {
   return match ? clip(match[1]!, 60) : undefined;
 }
 
+const ERROR_PRIORITY_KEYS = ["error", "message", "reason", "detail", "details", "stderr", "output", "result", "text", "content"] as const;
+const ERROR_SKIP_KEYS = new Set(["ok", "isError", "is_error", "type", "id", "kind", "exitCode", "exit_code", "status"]);
+const JSON_META_LINE = /^["'\[{},\]]*$|^"(?:ok|isError|is_error|type)"\s*:/;
+const TRUNCATED_JSON_FIELD = /(?:^|\n)\s*"(?:error|message|reason|detail|details|stderr|output|result|text)"\s*:\s*"((?:[^"\\]|\\.)*)/;
+
+function unescapeJsonFragment(raw: string): string {
+  return raw.replace(/\\([\\/"bfnrt]|u[0-9a-fA-F]{4})/g, (_m, esc: string) => {
+    switch (esc[0]) {
+      case "n": return "\n";
+      case "r": return "\r";
+      case "t": return "\t";
+      case "\"": return "\"";
+      case "/": return "/";
+      case "\\": return "\\";
+      case "b": return "\b";
+      case "f": return "\f";
+      case "u": return String.fromCharCode(Number.parseInt(esc.slice(1), 16));
+      default: return esc;
+    }
+  });
+}
+
+function extractErrorText(value: unknown, depth = 0): string | undefined {
+  if (depth > 4 || value === null || value === undefined) return undefined;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    if (/^[\[{]/.test(trimmed)) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        const extracted = extractErrorText(parsed, depth + 1);
+        if (extracted) return extracted;
+      } catch {
+        const match = TRUNCATED_JSON_FIELD.exec(trimmed);
+        if (match?.[1]) {
+          const decoded = unescapeJsonFragment(match[1]);
+          if (decoded.trim()) return decoded;
+        }
+        const meaningful = trimmed
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .find((line) => line && !JSON_META_LINE.test(line) && line !== "[… preview shortened]");
+        if (meaningful) return meaningful;
+        return undefined;
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const extracted = extractErrorText(item, depth + 1);
+      if (extracted) return extracted;
+    }
+    return undefined;
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    for (const key of ERROR_PRIORITY_KEYS) {
+      if (key in obj) {
+        const extracted = extractErrorText(obj[key], depth + 1);
+        if (extracted) return extracted;
+      }
+    }
+    for (const [key, child] of Object.entries(obj)) {
+      if (ERROR_SKIP_KEYS.has(key)) continue;
+      if (typeof child === "string" || (child && typeof child === "object")) {
+        const extracted = extractErrorText(child, depth + 1);
+        if (extracted) return extracted;
+      }
+    }
+    const exitCode = typeof obj.exitCode === "number" ? obj.exitCode : typeof obj.exit_code === "number" ? obj.exit_code : undefined;
+    if (typeof exitCode === "number" && exitCode !== 0) return `Exit code ${exitCode}`;
+    return undefined;
+  }
+  return undefined;
+}
+
 export function errorLine(output: unknown): string | undefined {
-  if (typeof output !== "string") return undefined;
-  const first = output.split("\n").find((line) => line.trim());
+  const raw = extractErrorText(output);
+  if (!raw) return undefined;
+  const redacted = redactSecretsInText(raw);
+  const first = redacted.split(/\r?\n/).find((line) => line.trim());
   return first ? clip(first, ERROR_MAX) : undefined;
 }
