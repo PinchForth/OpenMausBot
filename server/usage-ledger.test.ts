@@ -94,6 +94,24 @@ describe("usage ledger files", () => {
     await expect(flushUsageLedger(join(dataDir, "blocked"))).resolves.toBeUndefined();
     expect(existsSync(join(dataDir, "blocked", "usage"))).toBe(false);
   });
+
+  it("persists failedSteps with sanitized first error line and redacted secrets", async () => {
+    appendUsage(dataDir, row({
+      at: "2026-09-03T10:00:00.000Z",
+      toolErrors: 2,
+      failedSteps: [
+        { tool: "bash", error: "fatal: auth failed for https://alice:hunter2secret@git.example.test/repo\nsecondary details" },
+        { tool: "read", error: "   \n\npermission denied with sk-proj-abcd1234567890efgh\nline 2" },
+        { tool: "   ", error: "ignored" },
+      ],
+    }));
+    await flushUsageLedger(dataDir);
+    const rows = readUsage(dataDir, { from: new Date("2026-09-01T00:00:00Z"), to: new Date("2026-09-30T23:59:59Z") });
+    expect(rows[0]!.failedSteps).toEqual([
+      { tool: "bash", error: "fatal: auth failed for https://alice:«redacted 13 chars»@git.example.test/repo" },
+      { tool: "read", error: "permission denied with «redacted 26 chars»" },
+    ]);
+  });
 });
 
 describe("usage ranges", () => {

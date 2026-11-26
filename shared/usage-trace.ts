@@ -11,6 +11,11 @@ export type TraceStatus = "ok" | "error" | "interrupted" | "ended";
 /** `partial`: the engine reported some token fields but not all; `unavailable`: none. Neither is ever shown as 0. */
 export type TraceUsageStatus = "complete" | "partial" | "unavailable";
 
+export interface FailedStepRecord {
+  tool: string;
+  error?: string;
+}
+
 export interface TraceParent {
   threadId: string;
   turnId: string;

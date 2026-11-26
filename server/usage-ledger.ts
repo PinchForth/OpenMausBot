@@ -3,7 +3,8 @@ import { personOf } from "./usage-attribution.ts";
 import { readFileSync } from "node:fs";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { TraceParent, TraceStatus, TraceUsageStatus } from "../shared/usage-trace.ts";
+import { redactSecretsInText } from "../shared/redact.ts";
+import type { FailedStepRecord, TraceParent, TraceStatus, TraceUsageStatus } from "../shared/usage-trace.ts";
 import type { ResolvedSender } from "../shared/wire.ts";
 import type { CostSource } from "./model-prices.ts";
 import { billableFor, type PriceList } from "./prices.ts";
@@ -46,6 +47,7 @@ export interface UsageRow {
   steps?: number;
   tools?: number;
   toolErrors?: number;
+  failedSteps?: FailedStepRecord[];
   cacheWrite?: number;
   reasoning?: number;
   contextTokens?: number;
@@ -92,6 +94,29 @@ const clean = (value: unknown): number =>
 const finiteOrNull = (value: unknown): number | null =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 
+const cleanLine = (value: string, max: number): string => {
+  const redacted = redactSecretsInText(value);
+  const first = redacted.split(/\r?\n/).find((line) => line.trim());
+  if (!first) return "";
+  const flat = redactSecretsInText(first.replace(/\s+/g, " ").trim());
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
+
+const failedStepsOf = (value: unknown): FailedStepRecord[] | null => {
+  if (!Array.isArray(value)) return null;
+  const out: FailedStepRecord[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const entry = item as { tool?: unknown; error?: unknown };
+    if (typeof entry.tool !== "string" || !entry.tool.trim()) continue;
+    const tool = cleanLine(entry.tool, 80) || "tool";
+    const error = typeof entry.error === "string" ? cleanLine(entry.error, 120) : "";
+    out.push({ tool, ...(error ? { error } : {}) });
+    if (out.length >= 50) break;
+  }
+  return out.length ? out : null;
+};
+
 const promptBytesOf = (value: unknown): { stable: number; volatile: number } | null => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as { stable?: unknown; volatile?: unknown };
@@ -113,8 +138,9 @@ export function usageRowKey(row: Pick<UsageRow, "at" | "threadId" | "botId">): s
 }
 
 export function appendUsage(dataDir: string, row: Omit<UsageRow, "at"> & { at?: string }): Promise<boolean> {
-  const { promptBytes: rawPromptBytes, ...rest } = row;
+  const { promptBytes: rawPromptBytes, failedSteps: rawFailedSteps, ...rest } = row;
   const promptBytes = promptBytesOf(rawPromptBytes);
+  const failedSteps = failedStepsOf(rawFailedSteps);
   const record: UsageRow = {
     ...rest,
     at: row.at ?? new Date().toISOString(),
@@ -122,6 +148,7 @@ export function appendUsage(dataDir: string, row: Omit<UsageRow, "at"> & { at?: 
     output: clean(row.output),
     ...(typeof row.cachedInput === "number" ? { cachedInput: clean(row.cachedInput) } : {}),
     ...(promptBytes ? { promptBytes } : {}),
+    ...(failedSteps ? { failedSteps } : {}),
     costUsd: finiteOrNull(row.costUsd),
   };
   if (record.costUsd === null) delete record.costSource;
