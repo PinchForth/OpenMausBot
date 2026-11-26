@@ -7,6 +7,7 @@ import { errorReplyFailure, type ErrorReplyFailure } from "../engine-errors.ts";
 import type { AcpConfig } from "./core.ts";
 import type { AcpHost, AcpLink } from "./host.ts";
 import type { AcpTurnSteering } from "./steer.ts";
+import type { TurnStepTracker } from "../../turn-continuation.ts";
 
 export type AcpAskFinish = (
   behavior: string,
@@ -37,6 +38,8 @@ export interface AcpTurn {
   interruptTimer: ReturnType<typeof setTimeout> | null;
   stopQuietWatch: (() => void) | null;
   flushAssistantText: () => void;
+  stepTracker: TurnStepTracker;
+  stopAtStepCap: () => void;
   receiveModelVariants: (result: any) => void;
   steering?: AcpTurnSteering;
 }

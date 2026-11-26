@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { classifyContinuable, writeTurnHandoff } from "./turn-continuation.ts";
+import { classifyContinuable, DEFAULT_TURN_STEP_CAP, TurnStepTracker, writeTurnHandoff } from "./turn-continuation.ts";
 
 let temp: string | undefined;
 afterEach(() => {
@@ -119,5 +119,42 @@ describe("classifyContinuable", () => {
     ["successful turn", null, "done", null],
   ] as const)("%s → %s", (_name, stopReason, failure, expected) => {
     expect(classifyContinuable(stopReason, failure)).toBe(expected);
+  });
+});
+
+describe("TurnStepTracker", () => {
+  it("defaults to a 150-step cap, tracks pending tools, and writes a redacted checkpoint", () => {
+    expect(DEFAULT_TURN_STEP_CAP).toBe(150);
+    const tracker = new TurnStepTracker();
+    for (let i = 1; i <= 149; i += 1) {
+      tracker.recordToolStart({ id: `c-${i}`, name: "Bash", input: { command: `echo ${i}` } });
+      expect(tracker.pendingTools).toBe(1);
+      tracker.recordToolEnd({ id: `c-${i}`, ok: true, output: `ok-${i}` });
+      expect(tracker.pendingTools).toBe(0);
+      tracker.completeStep();
+      expect(tracker.exhausted).toBe(false);
+    }
+    tracker.recordToolStart({ id: "c-150", name: "Bash", input: { command: "echo Authorization: Bearer sk-secret1234567890" } });
+    tracker.recordToolEnd({ id: "c-150", ok: true, output: "done" });
+    tracker.recordAssistantText("Halfway through sk-ant-secretvalue12345");
+    tracker.completeStep();
+    expect(tracker.exhausted).toBe(true);
+    expect(tracker.steps).toBe(150);
+    const { failure, handoffPath } = tracker.writeCheckpoint({
+      threadId: "thread-step-cap",
+      turnId: "turn-step-cap",
+      model: "claude-sonnet",
+      sessionId: "sess-1",
+      task: "Run 160 steps with sk-task-secret999999999999",
+    });
+    expect(failure).toMatch(/^Stopped after 150 steps without a final answer/);
+    expect(handoffPath).not.toBeNull();
+    const content = readFileSync(handoffPath!, "utf8");
+    expect(content).toContain("Provider session: sess-1");
+    expect(content).toContain("Steps used: 150");
+    expect(content).toContain("Tool calls used: 150");
+    expect(content).not.toContain("sk-secret1234567890");
+    expect(content).not.toContain("sk-ant-secretvalue12345");
+    expect(content).not.toContain("sk-task-secret999999999999");
   });
 });

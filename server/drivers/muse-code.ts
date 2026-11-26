@@ -27,6 +27,7 @@ import { parseProtocolAskQuestions, questionAnswersById, type ProtocolAskQuestio
 import type { EffortLevel } from "../../shared/wire.ts";
 import { promptHalves, readPromptSplitReceipt, splitSessionPrompt, writePromptSplitReceipt, type PromptSplitReceipt } from "./prompt-split.ts";
 import { turnStdioMcpServers } from "./turn-mcp.ts";
+import { DEFAULT_TURN_STEP_CAP, TurnStepTracker } from "../turn-continuation.ts";
 
 const DRIVER_KIND = "museCode";
 const PROVIDER_ID = "meta";
@@ -193,6 +194,7 @@ interface Pending {
 }
 
 interface ActiveTurn {
+  taskText?: string;
   turnId: string;
   /** Muse's turn id: the turn/start command id the host mints; unset until sent. */
   nativeTurnId?: string;
@@ -203,6 +205,7 @@ interface ActiveTurn {
   stopping?: Promise<void>;
   onFinished?: () => void;
   receipt?: { key: string; receipt: PromptSplitReceipt };
+  stepTracker: TurnStepTracker;
 }
 
 interface Host {
@@ -389,6 +392,24 @@ export const MuseCodeDriver: ProviderDriver<MuseConfig> = {
         ...(completed.stopReason ? { stopReason: completed.stopReason } : {}), ...(completed.usage ? { usage: completed.usage } : {}) });
     };
 
+    const stopAtStepCap = (state: ThreadState, active: ActiveTurn, taskText: string) => {
+      if (active.finished) return;
+      const { failure, handoffPath } = active.stepTracker.writeCheckpoint({
+        threadId: state.threadId,
+        turnId: active.turnId,
+        model: state.model,
+        sessionId: state.sessionId,
+        task: taskText,
+      });
+      emit({ type: "runtime.error", threadId: state.threadId, turnId: active.turnId, message: failure, terminal: true });
+      if (handoffPath) emit({ type: "cap.exhausted", threadId: state.threadId, turnId: active.turnId, handoffPath, reason: "cap" });
+      if (state.host && state.sessionId && active.nativeTurnId) {
+        void state.host.connection.command("turn/interrupt", { sessionId: state.sessionId, turnId: active.nativeTurnId }).catch(() => {});
+      }
+      void closeHost(state);
+      finishTurn(state, active, { ok: false, stopReason: "step_cap" });
+    };
+
     const failTurn = (state: ThreadState, active: ActiveTurn, message: string) => {
       if (active.finished) return;
       emit({ type: "runtime.error", threadId: state.threadId, turnId: active.turnId, message: redactSecretsInText(message), terminal: true });
@@ -410,6 +431,7 @@ export const MuseCodeDriver: ProviderDriver<MuseConfig> = {
           if (item.kind === "agentMessage") {
             if (item.status !== "completed" || item.retracted) return;
             const text = item.text ?? "";
+            if (text) active.stepTracker.recordAssistantText(text);
             const streamed = active.streamed.get(item.itemId) ?? "";
             if (text.startsWith(streamed) && text.length > streamed.length) {
               emit({ type: "content.delta", threadId, turnId: active.turnId, itemId: item.itemId, streamKind: "assistant_text", delta: text.slice(streamed.length) });
@@ -418,9 +440,21 @@ export const MuseCodeDriver: ProviderDriver<MuseConfig> = {
           } else if (item.kind === "reasoning") {
             if (!seen) emit({ type: "item.started", threadId, turnId: active.turnId, itemId: item.itemId, itemType: "reasoning" });
           } else if (TOOL_KINDS.has(item.kind)) {
-            if (!seen) emit({ type: "item.started", threadId, turnId: active.turnId, itemId: item.itemId, itemType: "tool", ...museToolStart(item) });
+            const started = museToolStart(item);
+            if (!seen) {
+              if (active.stepTracker.exhausted) {
+                stopAtStepCap(state, active, active.taskText ?? "");
+                return;
+              }
+              active.stepTracker.recordToolStart({ id: item.itemId, name: started.title, input: item.args });
+              emit({ type: "item.started", threadId, turnId: active.turnId, itemId: item.itemId, itemType: "tool", ...started });
+            }
             if (!isRunning(item.status) && (!seen || isRunning(seen.status))) {
-              emit({ type: "item.completed", threadId, turnId: active.turnId, itemId: item.itemId, itemType: "tool", ...museToolOutput(item) });
+              const out = museToolOutput(item);
+              active.stepTracker.recordToolEnd({ id: item.itemId, name: started.title, ok: out.ok, output: out.output });
+              emit({ type: "item.completed", threadId, turnId: active.turnId, itemId: item.itemId, itemType: "tool", ...out });
+              active.stepTracker.completeStep();
+              if (active.stepTracker.exhausted) stopAtStepCap(state, active, active.taskText ?? "");
             }
           }
           return;
@@ -663,7 +697,7 @@ export const MuseCodeDriver: ProviderDriver<MuseConfig> = {
         const state = threadOf(turn.threadId);
         if (state.active && !state.active.finished) throw new Error("Muse Code is still working on this thread.");
         const turnId = newId();
-        const active: ActiveTurn = { turnId, items: new Map(), streamed: new Map(), finished: false };
+        const active: ActiveTurn = { turnId, items: new Map(), streamed: new Map(), finished: false, taskText: turn.text, stepTracker: new TurnStepTracker(DEFAULT_TURN_STEP_CAP) };
         state.active = active;
         void runTurn(state, turn, active);
         return { turnId };

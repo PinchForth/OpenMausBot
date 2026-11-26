@@ -1436,3 +1436,79 @@ describe("PiDriver snapshot", () => {
     await instance.dispose();
   });
 });
+
+describe("PiDriver 150-step cap boundary", () => {
+  beforeEach(() => chmodSync(FAKE_CLI, 0o755));
+
+  it("stops cleanly at exact step 150, persists a checkpoint, and never starts step 151", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-pi-cap150-"));
+    const prevDataDir = process.env.OMB_DATA_DIR;
+    process.env.OMB_DATA_DIR = dataDir;
+    const instance = await PiDriver.create({
+      instanceId: "pi-cap-over",
+      displayName: undefined,
+      environment: { FAKE_PI_MODE: "step-loop", FAKE_PI_STEP_COUNT: "160", FAKE_PI_FINISH_AFTER_STEP_LOOP: "1" },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const recorder = recordEvents(instance.adapter);
+    const events = recorder.events;
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-cap-150", text: "Execute long multi-step workflow" });
+      await expect.poll(() => events.find((e) => e.type === "turn.completed"), { timeout: 20_000 }).toMatchObject({
+        type: "turn.completed",
+        ok: false,
+        stopReason: "step_cap",
+      });
+      const startedTools = events.filter((e) => e.type === "item.started" && e.itemType === "tool");
+      const completedTools = events.filter((e) => e.type === "item.completed" && e.itemType === "tool");
+      expect(startedTools).toHaveLength(150);
+      expect(completedTools).toHaveLength(150);
+      expect(startedTools.some((e) => e.itemId === "loop_call_151")).toBe(false);
+      const capEvent = events.find((e) => e.type === "cap.exhausted") as (RuntimeEvent & { type: "cap.exhausted" }) | undefined;
+      expect(capEvent).toBeDefined();
+      const checkpoint = readFileSync(capEvent!.handoffPath, "utf8");
+      expect(checkpoint).toContain("Steps used: 150");
+      expect(checkpoint).toContain("Execute long multi-step workflow");
+      expect(checkpoint).toContain("echo step-150");
+      expect(checkpoint).not.toContain("echo step-151");
+    } finally {
+      if (prevDataDir === undefined) delete process.env.OMB_DATA_DIR;
+      else process.env.OMB_DATA_DIR = prevDataDir;
+      recorder.stop();
+      await instance.dispose();
+      removeTempDir(dataDir);
+    }
+  }, 30_000);
+
+  it("allows all 150 steps to finish normally when the 150th step leads to end_turn", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-pi-exact150-"));
+    const prevDataDir = process.env.OMB_DATA_DIR;
+    process.env.OMB_DATA_DIR = dataDir;
+    const instance = await PiDriver.create({
+      instanceId: "pi-cap-exact",
+      displayName: undefined,
+      environment: { FAKE_PI_MODE: "step-loop", FAKE_PI_STEP_COUNT: "150", FAKE_PI_FINISH_AFTER_STEP_LOOP: "1" },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const recorder = recordEvents(instance.adapter);
+    const events = recorder.events;
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-exact-150", text: "Execute exactly 150 steps" });
+      await expect.poll(() => events.find((e) => e.type === "turn.completed"), { timeout: 20_000 }).toMatchObject({
+        type: "turn.completed",
+        ok: true,
+        stopReason: "end_turn",
+      });
+      expect(events.some((e) => e.type === "cap.exhausted")).toBe(false);
+      expect(events.filter((e) => e.type === "item.completed" && e.itemType === "tool")).toHaveLength(150);
+    } finally {
+      if (prevDataDir === undefined) delete process.env.OMB_DATA_DIR;
+      else process.env.OMB_DATA_DIR = prevDataDir;
+      recorder.stop();
+      await instance.dispose();
+      removeTempDir(dataDir);
+    }
+  }, 30_000);
+});

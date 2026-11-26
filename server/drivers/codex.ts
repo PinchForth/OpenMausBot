@@ -42,6 +42,7 @@ import type {
   TextGenerationOptions,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { DEFAULT_TURN_STEP_CAP, TurnStepTracker } from "../turn-continuation.ts";
 import { codexSelectedProviderArgs, decodeCodexSelection, OFFICIAL_CODEX_PROVIDER, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { codexBackgroundProviderArgs, codexBackgroundRoute, runCodexBackgroundRoute, runCodexOneShot } from "./codex-background-text.ts";
 import { augmentedPath } from "../env-path.ts";
@@ -682,6 +683,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         usageBaseline: undefined as { input: number; output: number; cachedInput: number } | undefined,
       };
 
+      const stepTracker = new TurnStepTracker(DEFAULT_TURN_STEP_CAP);
       const asks = new Map<string, CodexAsk>();
       let nextId = 1;
       const sensitiveResponseIds = new Set<number>();
@@ -775,6 +777,22 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         return stopped;
       };
 
+      const stopAtStepCap = () => {
+        if (state.settled || abandoned) return;
+        const { failure, handoffPath } = stepTracker.writeCheckpoint({
+          threadId,
+          turnId,
+          model: turn.model,
+          usage: state.usage,
+          hasUsage: Boolean(state.usage),
+          sessionId: codexThreadId,
+          task: turn.text,
+        });
+        state.lastError = failure;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: failure, terminal: true });
+        if (handoffPath) emit({ ...base(threadId, turnId), type: "cap.exhausted", handoffPath, reason: "cap" });
+        void settle(false, "step_cap");
+      };
       const settle = async (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
         state.settled = true; authBridge?.close();
@@ -1081,6 +1099,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           case "item/fileChange/patchUpdated": { const draft = codexPatchProgress(p); if (draft) emit({ ...base(threadId, turnId), ...draft }); break; }
           case "item/commandExecution/outputDelta": { const output = codexCommandOutput(p); if (output) emit({ ...base(threadId, turnId), ...output }); break; }
           case "item/started": {
+            if (stepTracker.exhausted) {
+              stopAtStepCap();
+              break;
+            }
             const item = p.item ?? {};
             const runs = item.type === "mcpToolCall" && item.tool === CALL_TOOL && typeof item.server === "string" && directoryMounts.has(item.server)
               ? directoryCallTarget(CALL_TOOL, item.arguments) : undefined;
@@ -1095,6 +1117,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                       ? "web_search"
                       : null;
             if (title) {
+              const input = toolDetailPreview(item.type === "commandExecution" ? { command: item.command, cwd: item.cwd } : item.type === "mcpToolCall" ? (runs ? item.arguments?.arguments ?? {} : item.arguments) : item.type === "fileChange" ? item.changes : item.query);
+              stepTracker.recordToolStart({ id: item.id, name: title, input });
               emit({
                 ...base(threadId, turnId),
                 type: "item.started",
@@ -1102,7 +1126,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 itemId: item.id,
                 title,
                 summary: item.type === "commandExecution" ? commandSummary({ command: item.command }) : undefined,
-                input: toolDetailPreview(item.type === "commandExecution" ? { command: item.command, cwd: item.cwd } : item.type === "mcpToolCall" ? (runs ? item.arguments?.arguments ?? {} : item.arguments) : item.type === "fileChange" ? item.changes : item.query),
+                input,
               });
             }
             break;
@@ -1111,6 +1135,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             const item = p.item ?? {};
             if (item.type === "agentMessage") {
               if (item.text?.trim()) {
+                stepTracker.recordAssistantText(item.text);
                 state.lastText = item.text;
                 if (!state.sawStreamDelta) {
                   emit({ ...base(threadId, turnId), ...messageItem(item), type: "content.delta", streamKind: "assistant_text", delta: item.text });
@@ -1133,18 +1158,26 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 });
               }
             } else if (["commandExecution", "fileChange", "mcpToolCall", "webSearch"].includes(item.type)) {
+              const ok = item.status !== "failed" && item.status !== "declined";
+              const output = toolDetailPreview(item.type === "commandExecution" ? { output: item.aggregatedOutput, exitCode: item.exitCode } : item.type === "mcpToolCall" ? item.error ?? item.result : item.type === "fileChange" ? item.changes : item.action);
+              stepTracker.recordToolEnd({ id: item.id, name: item.tool ?? item.name ?? item.type, ok, output });
+              stepTracker.completeStep();
               emit({
                 ...base(threadId, turnId),
                 type: "item.completed",
                 itemType: "tool",
                 itemId: item.id,
-                ok: item.status !== "failed" && item.status !== "declined",
-                output: toolDetailPreview(item.type === "commandExecution" ? { output: item.aggregatedOutput, exitCode: item.exitCode } : item.type === "mcpToolCall" ? item.error ?? item.result : item.type === "fileChange" ? item.changes : item.action),
+                ok,
+                output,
               });
               if (item.type === "mcpToolCall") {
                 for (const img of extractMcpImages(item.result)) {
                   emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_image", data: img.data, fromTool: true });
                 }
+              }
+              if (stepTracker.exhausted && stepTracker.pendingTools === 0) {
+                stopAtStepCap();
+                break;
               }
             } else if (item.type === "reasoning") {
               emit({ ...base(threadId, turnId), type: "item.updated", itemType: "reasoning", tokens: null });
